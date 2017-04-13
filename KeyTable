@@ -1,0 +1,4 @@
+mail._domainkey.libroxml.com libroxml.com:mail:/keys/libroxml.com/mail.private
+mail._domainkey.libroxml.net libroxml.net:mail:/keys/libroxml.net/mail.private
+mail._domainkey.blunderer.org blunderer.org:mail:/keys/blunderer.org/mail.private
+mail._domainkey.lelong.xyz lelong.xyz:mail:/keys/lelong.xyz/mail.private
