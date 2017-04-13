@@ -1,0 +1,16 @@
+#
+# opendkim container.
+#
+# Exposes:
+# - port 12301/tcp
+# Volumes
+# - keys-opendkim
+
+# BUILD
+docker build -t opendkim:latest .
+
+# CREATE
+docker create --name myopendkim -vkeys-opendkim:/keys --restart always opendkim:latest
+
+# RUN
+docker start myopendkim
