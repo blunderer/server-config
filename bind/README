@@ -1,0 +1,18 @@
+#
+# bind container.
+#
+# Exposes:
+# - port 53/tcp
+# - port 53/udp
+
+# BUILD
+docker build -t bind:latest .
+
+# CREATE PRIMARY DNS
+docker create --name mybind -p53:53 -p53:53/udp --restart always bind:latest 5.135.157.10 5.135.157.10 37.187.111.9
+
+# CREATE SECONDARY DNS
+docker create --name mybind -p53:53 -p53:53/udp --restart always bind:latest 37.187.111.9 5.135.157.10 37.187.111.9
+
+# RUN
+docker start mybind
