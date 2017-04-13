@@ -1,0 +1,16 @@
+#
+# mysql container.
+#
+# Exposes:
+# - port 3306/tcp
+# Volumes:
+# - mysql
+
+# BUILD
+docker build -t mysql:latest .
+
+# CREATE
+docker create --name mymysql -v mysql:/var/lib/mysql/ --restart always mysql:latest
+
+# RUN
+docker start mymysql
