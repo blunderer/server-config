@@ -8,24 +8,20 @@
 zone "libroxml.net" {
 	type master;
 	allow-transfer { any; };
-	also-notify { 37.187.111.9; };
 	file "/etc/bind/libroxml.net.conf";
 };
 zone "libroxml.com" {
 	type master;
 	allow-transfer { any; };
-	also-notify { 37.187.111.9; };
 	file "/etc/bind/libroxml.com.conf";
 };
 zone "blunderer.org" {
 	type master;
 	allow-transfer { any; };
-	also-notify { 37.187.111.9; };
 	file "/etc/bind/blunderer.org.conf";
 };
 zone "lelong.xyz" {
 	type master;
 	allow-transfer { any; };
-	also-notify { 37.187.111.9; };
 	file "/etc/bind/lelong.xyz.conf";
 };
