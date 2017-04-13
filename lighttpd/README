@@ -1,0 +1,18 @@
+#
+# lighttpd container.
+#
+# Exposes:
+# - port 80/tcp
+# - port 443/tcp
+# Volumes:
+# - www
+# - keys-www
+
+# BUILD
+docker build -t lighttpd:latest .
+
+# CREATE
+docker create --name mylighttpd -v www:/www -vkeys-www:/keys -p 80:80 -p 443:443 --link mymysql --restart always lighttpd:latest
+
+# RUN
+docker start mylighttpd
