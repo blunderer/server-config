@@ -1,0 +1,77 @@
+# See /usr/share/postfix/main.cf.dist for a commented, more complete version
+
+
+# Debian specific:  Specifying a file name will cause the first
+# line of that file to be used as the name.  The Debian default
+# is /etc/mailname.
+#myorigin = /etc/mailname
+
+smtpd_banner = Welcome to $myhostname ESMTP running $mail_name (Debian/GNU)
+biff = no
+
+# appending .domain is the MUA's job.
+append_dot_mydomain = no
+
+# Uncomment the next line to generate "delayed mail" warnings
+#delay_warning_time = 4h
+
+readme_directory = no
+
+# TLS parameters
+smtp_tls_security_level = may
+smtpd_tls_cert_file=/keys/ssl/certs/ssl-cert-snakeoil.pem
+smtpd_tls_key_file=/keys/ssl/private/ssl-cert-snakeoil.key
+smtpd_tls_CAfile=/keys/ssl/certs/cacert.pem
+smtpd_tls_CApath=/keys/ssl/certs
+smtpd_use_tls = yes
+smtpd_tls_session_cache_timeout = 3600s
+smtpd_tls_session_cache_database = btree:${data_directory}/smtpd_scache
+smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
+
+# SMTPD
+smtpd_relay_restrictions = permit_mynetworks permit_sasl_authenticated defer_unauth_destination
+myhostname = blunderer.org
+alias_maps = hash:/etc/aliases
+alias_database = hash:/etc/aliases
+myorigin = /etc/mailname
+mydestination = localhost
+relayhost = 
+mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128
+mailbox_size_limit = 0
+recipient_delimiter = +
+inet_interfaces = all
+
+message_size_limit = 20480000
+
+
+#
+# SASL AUTH
+#
+smtpd_sasl_local_domain = lelong.xyz
+smtpd_tls_auth_only = yes
+smtpd_sasl_auth_enable = yes
+smtpd_sasl_path = smtpd
+smtpd_sasl_type = cyrus
+smtpd_sasl_security_options = noanonymous
+smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
+broken_sasl_auth_clients = yes
+smtpd_recipient_restrictions = permit_sasl_authenticated
+                               sleep 5
+                               permit_mynetworks
+                               reject_unauth_destination
+
+tls_random_source = dev:/dev/urandom
+
+#
+# Mail redirdctions
+#
+virtual_alias_domains = lelong.xyz blunderer.org libroxml.net libroxml.com
+virtual_alias_maps = hash:/etc/postfix/virtual
+
+#
+# DKIM
+#
+milter_protocol = 2
+milter_default_action = accept
+smtpd_milters = inet:@myopendkim@:12301
+non_smtpd_milters = inet:@myopendkim@:12301
