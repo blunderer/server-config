@@ -1,0 +1,19 @@
+#
+# postfix container.
+#
+# Exposes:
+# - port 25/tcp
+# - port 465/tcp
+# - port 587/tcp
+# Volumes:
+# - keys-postfix
+# - users
+
+# BUILD
+docker build -t postfix:latest .
+
+# CREATE
+docker create --name mypostfix -v keys-postfix:/keys -v users:/var/lib/etc/ --link=myopendkim -p 25:25 -p 465:465 -p 587:587 --restart always postfix:latest
+
+# RUN
+docker start mypostfix
