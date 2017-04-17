@@ -9,6 +9,7 @@ docker volume create www
 docker volume create keys-www
 docker volume create keys-postfix
 docker volume create keys-opendkim
+docker volume create keys-transmission
 
 # Mysql tables
 docker volume create mysql
@@ -25,10 +26,12 @@ docker run --rm -v users:/users -v /home/data/users/:/backup:ro -t jessie:latest
 docker run --rm -v keys-www:/keys:ro -v /home/data/keys/lighttpd:/backup: -t jessie:latest /usr/bin/rsync -aP --delete /keys/ /backup/
 docker run --rm -v keys-postfix:/keys:ro -v /home/data/keys/postfix:/backup: -t jessie:latest /usr/bin/rsync -aP --delete /keys/ /backup/
 docker run --rm -v keys-opendkim:/keys:ro -v /home/data/keys/opendkim:/backup: -t jessie:latest /usr/bin/rsync -aP --delete /keys/ /backup/
+docker run --rm -v keys-transmission:/keys:ro -v /home/data/keys/transmission:/backup: -t jessie:latest /usr/bin/rsync -aP --delete /keys/ /backup/
 # Populate Keys
 docker run --rm -v keys-www:/keys -v /home/data/keys/lighttpd:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/
 docker run --rm -v keys-postfix:/keys -v /home/data/keys/postfix:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/
 docker run --rm -v keys-opendkim:/keys -v /home/data/keys/opendkim:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/
+docker run --rm -v keys-transmission:/keys -v /home/data/keys/transmission:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/
 
 # Backup ServerRoot
 docker run --rm -v www:/www:ro -v /home/data/www/:/backup: -t jessie:latest /usr/bin/rsync -aP --delete /www/ /backup/

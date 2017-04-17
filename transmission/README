@@ -4,13 +4,14 @@
 # Exposes:
 # - port 9091/tcp
 # Volumes:
+# - keys-transmission
 # - /home/torrent
 
 # BUILD
 docker build -t transmission:latest .
 
 # CREATE
-docker create --name mytransmission -v/home/torrent/:/data/ -p9091:9091 --restart always transmission:latest
+docker create --name mytransmission -vkeys-transmission:/keys -v/home/torrent/:/data/ -p9091:9091 --restart always transmission:latest
 
 # RUN
 docker start mytransmission

@@ -58,6 +58,7 @@ fi
 
 if has_to_run "volume"; then
 	echo "START CREATING VOLUMES"
+	docker volume create keys-transmission &
 	docker volume create keys-opendkim &
 	docker volume create keys-postfix &
 	docker volume create keys-www &
@@ -70,6 +71,7 @@ fi
 
 if has_to_run "populate"; then
 	echo "START POPULATING VOLUMES"
+	docker run --rm -v keys-transmission:/keys -v /home/data/keys/transmission:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/ &
 	docker run --rm -v keys-opendkim:/keys -v /home/data/keys/opendkim:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/ &
 	docker run --rm -v keys-postfix:/keys -v /home/data/keys/postfix:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/ &
 	docker run --rm -v keys-www:/keys -v /home/data/keys/lighttpd:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/ &
