@@ -13,7 +13,8 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get install -y supervisor \
 		bind9 \
 		bind9utils \
-		bind9-host && \
+		bind9-host \
+		dnsutils && \
 	apt-get clean
 
 # Copy configuration
@@ -29,7 +30,10 @@ RUN mkdir -p /var/run/named && \
 # Set UID/GID
 RUN setuidgid.sh bind bind 1000 1000
 
+# Resources
+COPY resources/ /
+RUN chmod +x /healthcheck.sh /entrypoint.sh
+
 # Run bind.
-COPY entrypoint.sh /
-RUN chmod +x /entrypoint.sh
+HEALTHCHECK --interval=2m --timeout=30s --retries=2 CMD /healthcheck.sh
 ENTRYPOINT [ "/entrypoint.sh" ]
