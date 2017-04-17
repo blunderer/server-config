@@ -14,7 +14,8 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get update && \
 	apt-get install -y supervisor \
 		postfix \
-		sasl2-bin && \
+		sasl2-bin \
+		telnet && \
 	apt-get clean
 
 # Copy configuration
@@ -28,7 +29,10 @@ COPY supervisord.conf /etc/default/
 # Set UID/GID
 RUN setuidgid.sh postfix postfix 1000 1000
 
+# Resources
+COPY resources/ /
+RUN chmod +x /healthcheck.sh /entrypoint.sh
+
 # Run postfix.
-COPY entrypoint.sh /
-RUN chmod +x /entrypoint.sh
+HEALTHCHECK --interval=1m --timeout=10s --retries=2 CMD /healthcheck.sh
 ENTRYPOINT [ "/entrypoint.sh" ]
