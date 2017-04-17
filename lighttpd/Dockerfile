@@ -37,7 +37,10 @@ COPY config /etc/lighttpd/
 # Set UID/GID
 RUN setuidgid.sh www-data www-data 1000 1000
 
+# Resources
+COPY resources/ /
+RUN chmod +x /healthcheck.sh /entrypoint.sh
+
 # Run lighttpd.
-COPY entrypoint.sh /
-RUN chmod +x /entrypoint.sh
+HEALTHCHECK --interval=1m --timeout=30s --retries=2 CMD /healthcheck.sh
 ENTRYPOINT [ "/entrypoint.sh" ]
