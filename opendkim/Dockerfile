@@ -23,7 +23,10 @@ COPY supervisord.conf /etc/default/
 # Set UID/GID
 RUN setuidgid.sh opendkim opendkim 1000 1000
 
-# Run opendkim.
-COPY entrypoint.sh /
-RUN chmod +x /entrypoint.sh
+# Resources
+COPY resources/ /
+RUN chmod +x /healthcheck.sh /entrypoint.sh
+
+# Run opendkim
+HEALTHCHECK --interval=5m --timeout=30s --retries=3 CMD /healthcheck.sh
 ENTRYPOINT [ "/entrypoint.sh" ]
