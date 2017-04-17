@@ -20,7 +20,10 @@ COPY config/my.cnf /etc/mysql/
 # Set UID/GID
 RUN setuidgid.sh mysql mysql 1000 1000
 
+# Resources
+COPY resources/ /
+RUN chmod +x /healthcheck.sh /entrypoint.sh
+
 # Run mysql
-COPY entrypoint.sh /
-RUN chmod +x /entrypoint.sh
+HEALTHCHECK --interval=1m --timeout=30s --retries=2 CMD /healthcheck.sh
 ENTRYPOINT [ "/entrypoint.sh" ]
