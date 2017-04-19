@@ -49,11 +49,11 @@ fi
 # Start process
 if has_to_run "base"; then
 	echo "START CREATING BASE IMAGE"
-	mkdir -p base
-	[ -d base/debian-jessie ] || debootstrap --include=rsync,openssh-server jessie base/debian-jessie && touch base/.debootstrap
-	cp common/* base/debian-jessie/usr/bin/
-	chmod +x base/debian-jessie/usr/bin/setuidgid.sh
-	(cd base/debian-jessie && tar -c . | docker import - jessie:latest)
+	mkdir -p ../base
+	[ -d ../base/debian-jessie ] || debootstrap --include=rsync,openssh-server jessie ../base/debian-jessie && touch ../base/.debootstrap
+	cp common/* ../base/debian-jessie/usr/bin/
+	chmod +x ../base/debian-jessie/usr/bin/setuidgid.sh
+	(cd ../base/debian-jessie && tar -c . | docker import - jessie:latest)
 fi
 
 if has_to_run "volume"; then
