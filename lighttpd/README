@@ -16,3 +16,6 @@ docker create --name mylighttpd -v www:/www -vkeys-www:/keys -p 80:80 -p 443:443
 
 # RUN
 docker start mylighttpd
+
+# RECONFIG
+docker cp config/ mylighttpd:/etc/lighttpd

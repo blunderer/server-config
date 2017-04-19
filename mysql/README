@@ -14,3 +14,6 @@ docker create --name mymysql -v mysql:/var/lib/mysql/ --restart always mysql:lat
 
 # RUN
 docker start mymysql
+
+# RECONFIG
+docker cp config/ mymysql:/etc/mysql

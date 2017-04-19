@@ -14,3 +14,6 @@ docker create --name myopendkim -vkeys-opendkim:/keys --restart always opendkim:
 
 # RUN
 docker start myopendkim
+
+# RECONFIG
+docker cp config/ myopendkim:/etc/opendkim

@@ -16,3 +16,6 @@ docker create --name mybind -p53:53 -p53:53/udp --restart always bind:latest 37.
 
 # RUN
 docker start mybind
+
+# RECONFIG
+docker cp config/ mybind:/etc/bind
