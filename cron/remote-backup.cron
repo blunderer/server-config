@@ -1,0 +1,1 @@
+0 3 * * * /usr/bin/rsync -aP --delete @source@/ @dest@/ 1>&2
