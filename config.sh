@@ -17,6 +17,7 @@ fi
 case $1 in
 	status)
 		(cd workdir && git status)
+		(cd backup && git status)
 		for dir in workdir/*/Dockerfile; do
 			CONTAINER=$(dirname $dir)
 			BRANCH=$(basename $CONTAINER)
@@ -27,6 +28,10 @@ case $1 in
 		DIFF=$(cd workdir && git diff HEAD..origin/docker | wc -l)
 		if [ $DIFF -ne 0 ]; then
 			(cd workdir && git push $FORCE origin docker:docker)
+		fi
+		DIFF=$(cd backup && git diff HEAD..origin/backup | wc -l)
+		if [ $DIFF -ne 0 ]; then
+			(cd backup && git push $FORCE origin backup:backup)
 		fi
 		for dir in workdir/*/Dockerfile; do
 			CONTAINER=$(dirname $dir)
@@ -39,11 +44,16 @@ case $1 in
 	;;
 	checkout | update)
 		REPO=$(git remote get-url origin 2> /dev/null || git remote show origin | grep Fetch | cut -d" " -f5)
-		[ -n "$FORCE" -a "$1" = "checkout" ] && rm -rf workdir
+		[ -n "$FORCE" -a "$1" = "checkout" ] && rm -rf workdir backup
 		if [ -d workdir ]; then
 			(cd workdir && git pull --rebase)
 		else
 			git clone --branch docker $REPO workdir
+		fi
+		if [ -d backup ]; then
+			(cd backup && git pull --rebase)
+		else
+			git clone --branch backup $REPO backup
 		fi
 		for dir in workdir/*/Dockerfile; do
 			CONTAINER=$(dirname $dir)
