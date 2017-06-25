@@ -18,6 +18,7 @@ case $1 in
 	status)
 		(cd workdir && git status)
 		(cd backup && git status)
+		(cd configs && git status)
 		for dir in workdir/*/Dockerfile; do
 			CONTAINER=$(dirname $dir)
 			BRANCH=$(basename $CONTAINER)
@@ -28,6 +29,10 @@ case $1 in
 		DIFF=$(cd workdir && git diff HEAD..origin/docker | wc -l)
 		if [ $DIFF -ne 0 ]; then
 			(cd workdir && git push $FORCE origin docker:docker)
+		fi
+		DIFF=$(cd configs && git diff HEAD..origin/configs | wc -l)
+		if [ $DIFF -ne 0 ]; then
+			(cd configs && git push $FORCE origin configs:configs)
 		fi
 		DIFF=$(cd backup && git diff HEAD..origin/backup | wc -l)
 		if [ $DIFF -ne 0 ]; then
@@ -49,6 +54,11 @@ case $1 in
 			(cd workdir && git pull --rebase)
 		else
 			git clone --branch docker $REPO workdir
+		fi
+		if [ -d configs ]; then
+			(cd configs && git pull --rebase)
+		else
+			git clone --branch configs $REPO configs
 		fi
 		if [ -d backup ]; then
 			(cd backup && git pull --rebase)
