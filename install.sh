@@ -49,11 +49,6 @@ cp scripts/* $BACKUP_FOLDER/
 
 # Prepare root cronfile
 cp cron/update.cron $CRONFILE
-if [ "$SERVER" = "master" ]; then
-	# Prepare user file for remote backup on master server
-	REMOTE_SERVERS_LIST=$(echo $REMOTE_SERVERS | tr " " ",")
-	sed "s,@backup@,$BACKUP_FOLDER,; s,@local@,$DOCKER_FOLDER,; s,@extra@,$REMOTE_SERVERS_LIST," cron/docker-backup.cron >> $CRONFILE
-fi
 install_cron root
 
 # Prepare user cronfile
