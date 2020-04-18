@@ -1,0 +1,106 @@
+# blunderer.org server management
+
+# TOPLEVEL
+-----------
+This folder should only contain the master script (part of branch master).
+It is used to populate all the sub repositories (stored as branches) into the current workspace.
+It can also be used to sync / push changes for all sub repositories.
+
+## WORKDIR
+----------
+This folder contains all docker applications management.
+deploy.sh: script used to manage all docker container in one commannd.
+manual.sh: script used to parse the docker apps README for clear text information
+source: script to parse docker apps README for deploy.sh
+'application'/: docker container descriptions.
+	- README: description of container management
+	- Dockerfile: Description of container internals
+	- config: per container specific configuration files
+	- resource: in-container management scripts
+
+## CONFIGS
+----------
+This folder contains the host configuration files for several needed daemon like:
+- ssh
+- fail2ban
+
+## BACKUP
+---------
+This folder contains the management of backups for blunderer.org docker containers.
+- cron: cron configuration to be installed
+- install.sh: install the relevant script and configure cron jobs
+- scripts: utilities to perform incremental backup on the host
+
+The script will backup as following:
+- source of backup: /home/data
+- destination of backup /home/backup
+- list of remote destinations to backup to 
+
+## SSL
+- config: getssl configuration
+- cron: cron configuration to be installed to auto renew SSL certificates with let's encrypt
+- tools: script that packages and install resulting SSL certs for lighttpd and postfix
+
+## DATA
+-------
+The containers expect a /home/data folder that contains:
+- config: a key value store that will be reachable at creation time for each docker application 
+- keys/$APP: per application folder that contains the secret keys to use
+- users/$APP: per-application folder that contains login information to use
+- List of per application volumes:
+	- mysql
+	- www
+
+# HOWTO
+--------
+This section describes how to perform basic action using server-config repository.
+
+## Checkout / Update / Commit
+------------------------------
+- Use ./config.sh to perform these actions directly
+
+## Install local tools
+-----------------------
+The local tools required are:
+- mail
+- ssh
+- fail2ban
+- docker
+- cron
+- rsync
+- git
+- dig (dnsutils)
+- getssl (https://github.com/srvrco/getssl.git): must be installed in $PATH
+
+You also need to configure authorized_keys for master server to SSH with no password to secondaries.
+
+## Configure SSL
+---------------------
+SSL is managed via getSSL and let's encrypt. Challenge is pushed to the
+lighttpd server and all domains/subdomains will use the same acme server-root
+for the challenge.
+
+# for adding new domains, edit blunderer.org/getssl.conf and add new SANS
+Then rsync the new folders to the DATA folder.
+
+For installing a new server:
+Run the command manually once for each domains:
+$ getssl -w /home/data/getssl blunderer.org
+If everything works well, install the CRON by running the install command.
+$ install server=primary|secondary
+
+This will attempt to renew SSL certificate every Friday at 5am
+
+## Configure backups
+---------------------
+Go to the backup folder and run the install command:
+$ install server=primary|secondary
+
+This will automatically configure the following
+- local backup daily at 4am localtime
+- remote backup to all remote hosts at 3am localtime [on primary only]
+- update machine OS at 1am localtime
+
+## Configure remote monitoring
+-------------------------------
+TODO
