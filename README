@@ -1,0 +1,8 @@
+# Expected format of application README
+
+IMAGE: the image name to be used for the container along with its version
+NAME: the name of the image
+PORTS: list of ports in the format host:container/protocol
+VOLUMES: list of volumes host_folder:mountpoint (with host_folder relative to /home/data)
+DEPENDS: name of the containers to be started before this one and linked
+OPTIONS: list of extra arguments to be passed at run time to docker
