@@ -14,14 +14,22 @@ if [ "$2" = "-f" ]; then
 	FORCE=-f
 fi
 
+base_dirs="workdir backup ssl configs"
+
 case $1 in
 	status)
-		(cd workdir && git status)
-		(cd backup && git status)
-		(cd configs && git status)
+		for dir in $base_dirs; do
+			echo "#######################################"
+			echo "######## $dir"
+			echo "#######################################"
+			(cd $dir && git status)
+		done
 		for dir in workdir/*/Dockerfile; do
 			CONTAINER=$(dirname $dir)
 			BRANCH=$(basename $CONTAINER)
+			echo "#######################################"
+			echo "#### $CONTAINER/config"
+			echo "#######################################"
 			(cd $CONTAINER/config && git status)
 		done
 	;;
@@ -33,6 +41,10 @@ case $1 in
 		DIFF=$(cd configs && git diff HEAD..origin/configs | wc -l)
 		if [ $DIFF -ne 0 ]; then
 			(cd configs && git push $FORCE origin configs:configs)
+		fi
+		DIFF=$(cd ssl && git diff HEAD..origin/ssl | wc -l)
+		if [ $DIFF -ne 0 ]; then
+			(cd ssl && git push $FORCE origin ssl:ssl)
 		fi
 		DIFF=$(cd backup && git diff HEAD..origin/backup | wc -l)
 		if [ $DIFF -ne 0 ]; then
@@ -59,6 +71,11 @@ case $1 in
 			(cd configs && git pull --rebase)
 		else
 			git clone --branch configs $REPO configs
+		fi
+		if [ -d ssl ]; then
+			(cd ssl && git pull --rebase)
+		else
+			git clone --branch ssl $REPO ssl
 		fi
 		if [ -d backup ]; then
 			(cd backup && git pull --rebase)
