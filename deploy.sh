@@ -1,17 +1,22 @@
 #!/bin/bash
 
+data=/home/new-data
+
 function usage() {
 	echo "usage: $0 action=<actions> dns=[primary|secondary]"
 	echo "  actions are"
-	echo "    - base"
-	echo "    - image"
-	echo "    - rename"
-	echo "    - volume"
-	echo "    - populate"
-	echo "    - container"
-	echo "    - replace"
-	echo "    - remove2"
-	echo "    - cleanup"
+	echo "    - list: list sorted containers by dependency"
+	echo "    - base: create the base debian image"
+	echo "    - image: create per application images"
+	echo "    - rename: rename running container before recreating them"
+	echo "    - revert: rename running container back to myname"
+	echo "    - container: create per application container"
+	echo "    - replace: stop old / start new container one at a time"
+	echo "    - start: start containers"
+	echo "    - stop: start containers"
+	echo "    - remove: remove containers"
+	echo "    - removeold: remove old containers"
+	echo "    - cleanup: remove unused images"
 	exit 1
 }
 
@@ -25,6 +30,17 @@ function has_to_run() {
 	return 1
 }
 
+function add_to_containers() {
+	containers=$1
+	new_container=$2
+
+	if echo $containers | grep $new_container > /dev/null; then
+		echo $containers
+	else
+		echo $containers $new_container
+	fi
+}
+
 # Parse options
 echo "$@" | grep "help" && usage
 
@@ -35,18 +51,26 @@ done
 cd "$(dirname $0)"
 actions=$(echo "$action" | tr "," " ")
 
-if [ "$dns" == "primary" ]; then
-	PRIMARY=true
-elif [ "$dns" == "secondary" ]; then
-	PRIMARY=false
-else
-	if has_to_run "container"; then
-		echo "Missing dns parameter."
-		usage
-	fi
+# Generate ordered containers list (based on dependencies)
+if [ -z "$containers" ]; then
+	for c in */README; do
+		. $c
+		for d in $DEPENDS; do
+			if [ -f "$d/README" ]; then
+				containers=$(add_to_containers "$containers" "$d")
+			fi
+		done
+		containers=$(add_to_containers "$containers" "$NAME")
+	done
 fi
 
 # Start process
+if has_to_run "list"; then
+	for c in $containers; do
+		echo $c
+	done
+fi
+
 if has_to_run "base"; then
 	echo "START CREATING BASE IMAGE"
 	mkdir -p ../base
@@ -56,128 +80,98 @@ if has_to_run "base"; then
 	(cd ../base/debian-jessie && tar -c . | docker import - jessie:latest)
 fi
 
-if has_to_run "volume"; then
-	echo "START CREATING VOLUMES"
-	docker volume create keys-transmission &
-	docker volume create keys-opendkim &
-	docker volume create keys-postfix &
-	docker volume create keys-www &
-	docker volume create mysql &
-	docker volume create users &
-	docker volume create www &
-
-	wait
-fi
-
-if has_to_run "populate"; then
-	echo "START POPULATING VOLUMES"
-	docker run --rm -v keys-transmission:/keys -v /home/data/keys/transmission:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/ &
-	docker run --rm -v keys-opendkim:/keys -v /home/data/keys/opendkim:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/ &
-	docker run --rm -v keys-postfix:/keys -v /home/data/keys/postfix:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/ &
-	docker run --rm -v keys-www:/keys -v /home/data/keys/lighttpd:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /keys/ &
-	docker run --rm -v mysql:/mysql/ -v /home/data/mysql/:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /mysql/ &
-	docker run --rm -v users:/users -v /home/data/users/:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /users/ &
-	docker run --rm -v www:/www -v /home/data/www/:/backup:ro -t jessie:latest /usr/bin/rsync -aP --delete /backup/ /www/ &
-
-	wait
-fi
-
 if has_to_run "image"; then
 	echo "START BUILDING IMAGES"
-	(cd bind && docker build -t bind:latest .) &
-	(cd lighttpd && docker build -t lighttpd:latest .) &
-	(cd mysql && docker build -t mysql:latest .) &
-	(cd opendkim && docker build -t opendkim:latest .) &
-	(cd postfix && docker build -t postfix:latest .) &
-	(cd transmission && docker build -t transmission:latest .) &
+	for c in $containers; do
+		target=$c
+		. $c/README
+		. source
+		$build &
+	done
 
 	wait
 fi
 
 if has_to_run "rename"; then
 	echo "START RENAMING CONTAINERS"
-	docker rename mymysql mymysql2 &
-	docker rename mylighttpd mylighttpd2 &
-	docker rename myopendkim myopendkim2 &
-	docker rename mypostfix mypostfix2 &
-	docker rename mytransmission mytransmission2 &
-	docker rename mybind mybind2 &
+	for c in $containers; do
+		. $c/README
+		docker rename my$NAME old_$NAME &
+	done
+
+	wait
+fi
+
+if has_to_run "revert"; then
+	echo "START RENAMING CONTAINERS"
+	for c in $containers; do
+		. $c/README
+		docker rename old_$NAME my$NAME &
+	done
 
 	wait
 fi
 
 if has_to_run "container"; then
 	echo "START BUILDING CONTAINERS"
-	docker create --name mymysql -v mysql:/var/lib/mysql/ --restart always mysql:latest
-	docker create --name mylighttpd -v www:/www -vkeys-www:/keys -p 80:80 -p 443:443 --link mymysql --restart always lighttpd:latest
-	docker create --name myopendkim -vkeys-opendkim:/keys --restart always opendkim:latest
-	docker create --name mypostfix -v keys-postfix:/keys -v users:/var/lib/etc/ --link=myopendkim -p 25:25 -p 465:465 -p 587:587 --restart always postfix:latest
-	docker create --name mytransmission -v/home/torrent/:/data/ -p9091:9091 --restart always transmission:latest
-	if $PRIMARY; then
-		docker create --name mybind -p53:53 -p53:53/udp --restart always bind:latest 5.135.157.10 5.135.157.10 37.187.111.9
-	else
-		docker create --name mybind -p53:53 -p53:53/udp --restart always bind:latest 37.187.111.9 5.135.157.10 37.187.111.9
-	fi
+	for c in $containers; do
+		. $c/README
+		. source
+		echo -n "$NAME " && $create
+	done
 fi
 
 if has_to_run "replace"; then
 	echo "START REPLACING CONTAINERS"
-	echo -n "=> replace mysql..."
-	read
-	docker stop mymysql2
-	docker start mymysql
-	echo "done"
-	echo -n "=> replace lighttpd..."
-	read
-	docker stop mylighttpd2
-	docker start mylighttpd
-	echo "done"
-	echo -n "=> replace transmission..."
-	read
-	docker stop mytransmission2
-	docker start mytransmission
-	echo "done"
-	echo -n "=> replace bind..."
-	read
-	docker stop mybind2
-	docker start mybind
-	echo "done"
-	echo -n "replace opendkim..."
-	read
-	docker stop myopendkim2
-	docker start myopendkim
-	echo "done"
-	echo -n "replace postfix..."
-	read
-	docker stop mypostfix2
-	docker start mypostfix
-	echo "done"
+	for c in $containers; do
+		. $c/README
+		. source
+		echo -n "=> replace $NAME"
+		read
+		docker stop old_$NAME
+		$start
+	done
 fi
 
 if has_to_run "remove"; then
-	echo "START REMOVING EXTRA CONTAINERS"
-	docker rm mymysql &
-	docker rm mylighttpd &
-	docker rm myopendkim &
-	docker rm mypostfix &
-	docker rm mytransmission &
-	docker rm mybind &
-
-	wait
+	echo "START REMOVING CONTAINERS"
+	for c in $containers; do
+		. $c/README
+		. source
+		$rm
+	done
 fi
 
-if has_to_run "remove2"; then
-	echo "START REMOVING EXTRA CONTAINERS"
+if has_to_run "removeold"; then
+	echo "START REMOVING OLD CONTAINERS"
 	echo "Press any key to continue"
 	read
-	docker rm mymysql2 &
-	docker rm mylighttpd2 &
-	docker rm myopendkim2 &
-	docker rm mypostfix2 &
-	docker rm mytransmission2 &
-	docker rm mybind2 &
+	for c in $containers; do
+		. $c/README
+		docker rm old_$NAME
+	done
+fi
 
-	wait
+if has_to_run "start"; then
+	echo "START CONTAINERS"
+	echo "Press any key to continue"
+	read
+	for c in $containers; do
+		. $c/README
+		. source
+		$start
+	done
+fi
+
+if has_to_run "stop"; then
+	echo "STOP CONTAINERS"
+	echo "Press any key to continue"
+	read
+	for c in $containers; do
+		. $c/README
+		. source
+		$stop
+	done
 fi
 
 if has_to_run "cleanup"; then

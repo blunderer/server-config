@@ -1,0 +1,18 @@
+# GENERATE BASE COMMAND TO MANAGE A CONTAINER
+for p in $PORTS; do
+	OPTIONS="$OPTIONS -p$p"
+done
+
+for v in $VOLUMES; do
+	OPTIONS="$OPTIONS -v$data/$v"
+done
+
+for c in $DEPENDS; do
+	OPTIONS="$OPTIONS --link my$c"
+done
+
+export build="docker build -t $IMAGE $target"
+export create="docker create --restart always --env-file $data/config --name my$NAME $OPTIONS $IMAGE"
+export start="docker start my$NAME"
+export stop="docker stop my$NAME"
+export rm="docker rm my$NAME"
