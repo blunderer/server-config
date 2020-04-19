@@ -1,6 +1,6 @@
 IMAGE="bind:latest"
 NAME="bind"
 PORTS="53:53/tcp 53:53/udp"
-VOLUMES="config:/env"
+VOLUMES="config:/env:ro"
 DEPENDS=""
 OPTIONS=""

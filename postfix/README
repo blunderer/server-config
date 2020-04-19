@@ -1,6 +1,6 @@
 IMAGE="postfix:latest"
 NAME="postfix"
 PORTS="25:25/tcp 465:465/tcp 587:587/tcp"
-VOLUMES="keys/postfix:/keys users/postfix/passwd:/etc/passwd users/postfix/shadow:/etc/shadow users/postfix/group:/etc/group"
+VOLUMES="keys/postfix:/keys:ro users/postfix/passwd:/etc/passwd:ro users/postfix/shadow:/etc/shadow:ro users/postfix/group:/etc/group:ro"
 DEPENDS="opendkim"
 OPTIONS=""

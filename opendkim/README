@@ -1,6 +1,6 @@
 IMAGE="opendkim:latest"
 NAME="opendkim"
 PORTS=""
-VOLUMES="keys/opendkim:/keys"
+VOLUMES="keys/opendkim:/keys:ro"
 DEPENDS=""
 OPTIONS=""

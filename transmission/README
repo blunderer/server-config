@@ -1,6 +1,6 @@
 IMAGE="transmission:latest"
 NAME="transmission"
 PORTS="9091:9091/tcp"
-VOLUMES="keys/transmission:/keys"
+VOLUMES="keys/transmission:/keys:ro"
 DEPENDS=""
 OPTIONS="-v/home/torrent/:/data/"
