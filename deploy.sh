@@ -73,11 +73,12 @@ fi
 
 if has_to_run "base"; then
 	echo "START CREATING BASE IMAGE"
-	mkdir -p ../base
-	[ -d ../base/debian-jessie ] || debootstrap --include=rsync,openssh-server jessie ../base/debian-jessie && touch ../base/.debootstrap
+	mkdir -p ../base || exit 1
+	[ -f ../base/.debootstrap ] || debootstrap --include=rsync,openssh-server jessie ../base/debian-jessie && touch ../base/.debootstrap
 	cp common/* ../base/debian-jessie/usr/bin/
 	chmod +x ../base/debian-jessie/usr/bin/setuidgid.sh
-	(cd ../base/debian-jessie && tar -c . | docker import - jessie:latest)
+	(cd ../base/debian-jessie && tar -c . | docker import - jessie:latest || exit 1)
+	[ -f ../base/.debootstrap ] || exit 1
 fi
 
 if has_to_run "image"; then
@@ -89,7 +90,7 @@ if has_to_run "image"; then
 		$build &
 	done
 
-	wait
+	wait || exit 2
 fi
 
 if has_to_run "rename"; then
@@ -99,7 +100,7 @@ if has_to_run "rename"; then
 		docker rename my$NAME old_$NAME &
 	done
 
-	wait
+	wait || exit 3
 fi
 
 if has_to_run "revert"; then
@@ -109,7 +110,7 @@ if has_to_run "revert"; then
 		docker rename old_$NAME my$NAME &
 	done
 
-	wait
+	wait || exit 4
 fi
 
 if has_to_run "container"; then
@@ -117,7 +118,7 @@ if has_to_run "container"; then
 	for c in $containers; do
 		. $c/README
 		. source
-		echo -n "$NAME " && $create
+		echo -n "$NAME " && $create || exit 5
 	done
 fi
 
@@ -129,7 +130,7 @@ if has_to_run "replace"; then
 		echo -n "=> replace $NAME"
 		read
 		docker stop old_$NAME
-		$start
+		$start || exit 6
 	done
 fi
 
@@ -159,7 +160,7 @@ if has_to_run "start"; then
 	for c in $containers; do
 		. $c/README
 		. source
-		$start
+		$start || echo "failed to start $c"
 	done
 fi
 
@@ -170,7 +171,7 @@ if has_to_run "stop"; then
 	for c in $containers; do
 		. $c/README
 		. source
-		$stop
+		$stop || echo "failed to stop $c"
 	done
 fi
 
