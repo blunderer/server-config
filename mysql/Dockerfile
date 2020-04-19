@@ -1,8 +1,8 @@
 #####################################################
 # Dockerfile to build the mysql container image.
-# This is based on custom debian jessie debootstrap.
+# This is based on custom debian stable debootstrap.
 #####################################################
-FROM jessie:latest
+FROM debian:latest
 MAINTAINER Tristan Lelong
 
 EXPOSE 3306

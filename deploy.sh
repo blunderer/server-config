@@ -72,12 +72,13 @@ if has_to_run "list"; then
 fi
 
 if has_to_run "base"; then
+	DVERS=jessie
 	echo "START CREATING BASE IMAGE"
 	mkdir -p ../base || exit 1
-	[ -f ../base/.debootstrap ] || debootstrap --include=rsync,openssh-server jessie ../base/debian-jessie && touch ../base/.debootstrap
-	cp common/* ../base/debian-jessie/usr/bin/
-	chmod +x ../base/debian-jessie/usr/bin/setuidgid.sh
-	(cd ../base/debian-jessie && tar -c . | docker import - jessie:latest || exit 1)
+	[ -f ../base/.debootstrap ] || debootstrap --include=rsync,openssh-server,logrotate ${DVERS} ../base/debian-${DVERS} && touch ../base/.debootstrap
+	cp common/* ../base/debian-${DVERS}/usr/bin/
+	chmod +x ../base/debian-${DVERS}/usr/bin/setuidgid.sh
+	(cd ../base/debian-${DVERS} && tar -c . | docker import - debian:latest || exit 1)
 	[ -f ../base/.debootstrap ] || exit 1
 fi
 
