@@ -181,5 +181,7 @@ if has_to_run "cleanup"; then
 	echo "Press any key to continue"
 	read
 	unused_images=$(docker images | grep none | awk '{print $3}' | xargs)
-	docker rmi $unused_images
+	if [ -n "unused_images" ]; then
+		docker rmi $unused_images
+	fi
 fi
