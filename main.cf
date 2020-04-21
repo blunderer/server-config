@@ -19,8 +19,8 @@ readme_directory = no
 
 # TLS parameters
 smtp_tls_security_level = may
-smtpd_tls_cert_file=/keys/ssl/certs/ssl-cert-snakeoil.pem
-smtpd_tls_key_file=/keys/ssl/private/ssl-cert-snakeoil.key
+smtpd_tls_cert_file=/keys/ssl/certs/blunderer.org.crt
+smtpd_tls_key_file=/keys/ssl/private/blunderer.org.key
 smtpd_tls_CAfile=/keys/ssl/certs/cacert.pem
 smtpd_tls_CApath=/keys/ssl/certs
 smtpd_use_tls = yes
