@@ -9,6 +9,9 @@ function usage() {
 }
 
 function install_cron() {
+	cat ${CRONFILE} > ${CRONFILE}.old
+	crontab -u $1 -l >> ${CRONFILE}.old
+	sort -u ${CRONFILE}.old > $CRONFILE
 	crontab -u $1 $CRONFILE
 }
 
