@@ -1,7 +1,7 @@
 #!/bin/bash
 
 BACKUP_FOLDER="/home/backup"
-DOCKER_FOLDER="/home/data"
+DOCKER_FOLDER="/home/new-data"
 DATA_FOLDERS="$DOCKER_FOLDER"
 REMOTE_SERVERS="blunderer@backup.blunderer.org:"
 CRONFILE="/tmp/cronfile"
