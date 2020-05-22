@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DATA_FOLDER="/home/data/keys/ssl/"
+DATA_FOLDER="/home/new-data/keys/ssl/"
 CRONFILE="/tmp/cronfile"
 
 function usage() {
