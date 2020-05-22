@@ -7,12 +7,13 @@ export PATH=$PATH:/home/blunderer/Projects/getssl
 
 # Renew if required
 getssl -w $DATA/ssl blunderer.org
+echo $?
 
 PRV_KEY=$DATA/ssl/blunderer.org/blunderer.org.key
 CERT=$DATA/ssl/blunderer.org/blunderer.org.crt
 FULLCHAIN=$DATA/ssl/blunderer.org/fullchain.crt
 LIGHTTPD_CERT=$DATA/ssl/blunderer.org/all.pem
-CA_CERT=$DATA/ssl/blunderer.org/ca.pem
+CA_CERT=$DATA/ssl/blunderer.org/chain.crt
 
 # Prepare lighttpd SSL cert: concatenation of key and cert
 cat $PRV_KEY $CERT > $LIGHTTPD_CERT
@@ -27,7 +28,7 @@ for dest in $DEST; do
 
   # Deploy postfix SSL
   rsync -aP $PRV_KEY $dest/postfix/ssl/private/blunderer.org.key
-  rsync -aP $CERT $dest/postfix/ssl/certs/blunderer.org.crt
+  rsync -aP $FULLCHAIN $dest/postfix/ssl/certs/blunderer.org.crt
   
   # Deploy lighttpd SSL
   rsync -aP $LIGHTTPD_CERT $dest/lighttpd/server.pem
