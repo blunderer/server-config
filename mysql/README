@@ -1,6 +1,6 @@
 IMAGE="mysql:latest"
 NAME="mysql"
 PORTS=""
-VOLUMES="mysql:/var/lib/mysql/"
+VOLUMES="mysql:/var/lib/mysql/ /var/log/docklog/mysql:/var/log:rw"
 DEPENDS=""
 OPTIONS=""

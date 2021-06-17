@@ -13,6 +13,12 @@ fi
 # Set permissions
 chown -R www-data.www-data /www
 
+# Make sure log directory is created
+mkdir -p /var/log/lighttpd
+chown -R www-data.www-data /var/log/lighttpd
+chmod -R 0750 /var/log/lighttpd
+
+
 # Make sure acme directory is created
 mkdir -p /www/acme/.well-known/acme-challenge/
 

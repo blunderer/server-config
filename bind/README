@@ -1,6 +1,6 @@
 IMAGE="bind:latest"
 NAME="bind"
 PORTS="53:53/tcp 53:53/udp"
-VOLUMES="config:/env:ro"
+VOLUMES="config:/env:ro /var/log/docklog/bind:/var/log:rw"
 DEPENDS=""
 OPTIONS=""
