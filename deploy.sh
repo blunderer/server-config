@@ -17,6 +17,8 @@ function usage() {
 	echo "    - remove: remove containers"
 	echo "    - removeold: remove old containers"
 	echo "    - cleanup: remove unused images"
+	echo ""
+	echo "Set containers='foo bar' environment variable to only touch containers foo and bar"
 	exit 1
 }
 
@@ -63,6 +65,9 @@ if [ -z "$containers" ]; then
 		containers=$(add_to_containers "$containers" "$NAME")
 	done
 fi
+
+echo "About to run actions '$actions' on '$containers'. Press enter to proceed."
+read y
 
 # Start process
 if has_to_run "list"; then
