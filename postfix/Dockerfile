@@ -15,7 +15,8 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get install -y supervisor \
 		postfix \
 		sasl2-bin \
-		telnet && \
+		telnet \
+		postsrsd && \
 	apt-get clean
 
 # Copy configuration
