@@ -4,7 +4,15 @@ for p in $PORTS; do
 done
 
 for v in $VOLUMES; do
-	OPTIONS="$OPTIONS -v$data/$v"
+	if [[ "$v" = /* ]]; then
+		d=$(echo $v | cut -f1 -d:)
+		[[ -e $d ]] || mkdir -p $d
+		OPTIONS="$OPTIONS -v$v"
+	else
+		d=$(echo $v | cut -f1 -d:)
+		[[ -e $data/$d ]] || mkdir -p $data/$d
+		OPTIONS="$OPTIONS -v$data/$v"
+	fi
 done
 
 for c in $DEPENDS; do
