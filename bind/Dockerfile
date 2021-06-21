@@ -28,7 +28,8 @@ RUN setuidgid.sh bind bind 1000 1000
 # Prepare rootfs
 RUN mkdir -p /var/run/named && \
 	chmod 775 /var/run/named && \
-	chown root:bind /var/run/named
+	chown root:bind /var/run/named && \
+	chown root:bind /var/cache/bind
 
 # Resources
 COPY resources/ /
