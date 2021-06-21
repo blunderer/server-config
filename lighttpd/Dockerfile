@@ -12,21 +12,36 @@ EXPOSE 443
 RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get update && \
 	apt-get install -y lighttpd \
-		php5 \
-		php5-cgi \
-		php5-cli \
-		php5-common \
-		php5-curl \
-		php5-gd \
-		php5-imap \
-		php5-json \
-		php5-ldap \
-		php5-mcrypt \
-		php5-mysql \
-		php5-pgsql \
-		php5-readline \
-		php5-sqlite \
-		mysql-client-5.5 && \
+		php \
+		php-cgi \
+		php-cli \
+		php-common \
+		php-curl \
+		php-gd \
+		php-imap \
+		php-json \
+		php-ldap \
+		php-mysql \
+		php-pgsql \
+		php-readline \
+		php-sqlite3 \
+		default-mysql-client \
+		php-dev \
+		libmcrypt-dev \
+		php-pear
+
+# Install PHP modules
+RUN pecl channel-update pecl.php.net && \
+	pecl install channel://pecl.php.net/mcrypt-1.0.2
+
+# Enable PHP modules
+RUN echo "extension=mcrypt.so" >> /etc/php/7.3/cli/conf.d/20-mcrypt.ini && \
+	echo "extension=mcrypt.so" >> /etc/php/7.3/cgi/conf.d/20-mcrypt.ini
+
+# Cleanup unneeded files
+RUN export DEBIAN_FRONTEND=noninteractive && \
+	apt-get remove -y php-dev && \
+	apt-get autoremove -y && \
 	apt-get clean
 
 # Add lighttpd configuration.
