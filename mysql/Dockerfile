@@ -10,7 +10,7 @@ EXPOSE 3306
 # Install required packages
 RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get update && \
-	apt-get install -y mysql-server && \
+	apt-get install -y mariadb-server && \
 	apt-get clean
 
 # Create configuration
