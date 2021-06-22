@@ -10,6 +10,9 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get update && \
 	apt-get clean
 
+# Set timezone
+RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
+
 # Resources
 COPY resources/ /
 RUN chmod +x /healthcheck.sh /entrypoint.sh

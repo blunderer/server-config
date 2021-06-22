@@ -15,6 +15,9 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 		transmission && \
 	apt-get clean
 
+# Set timezone
+RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
+
 # Copy configuration
 COPY config/ /etc/transmission-daemon/
 

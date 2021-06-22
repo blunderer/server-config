@@ -15,6 +15,9 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 		opendkim-tools && \
 	apt-get clean
 
+# Set timezone
+RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
+
 # Copy configuration
 RUN mkdir -p /var/run/opendkim/
 COPY config/ /etc/opendkim/

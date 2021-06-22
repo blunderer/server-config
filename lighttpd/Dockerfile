@@ -44,6 +44,9 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get autoremove -y && \
 	apt-get clean
 
+# Set timezone
+RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
+
 # Add lighttpd configuration.
 RUN rm -rf /etc/lighttpd
 RUN mkdir -p /etc/lighttpd/

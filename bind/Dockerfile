@@ -17,6 +17,9 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 		dnsutils && \
 	apt-get clean
 
+# Set timezone
+RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
+
 # Copy configuration
 RUN rm -rf /etc/bind
 COPY config/ /etc/bind/

@@ -19,6 +19,9 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 		postsrsd && \
 	apt-get clean
 
+# Set timezone
+RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
+
 # Copy configuration
 RUN rm -rf /etc/postfix/* && \
 	mkdir -p /var/lib/etc/ && \

@@ -13,6 +13,9 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 	apt-get install -y mariadb-server && \
 	apt-get clean
 
+# Set timezone
+RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
+
 # Create configuration
 RUN install -m 755 -o mysql -g root -d /var/run/mysqld
 COPY config/my.cnf /etc/mysql/
