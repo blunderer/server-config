@@ -12,6 +12,8 @@ bantime  = 3600
 findtime = 600
 maxretry = 3
 
+chain = DOCKER-USER
+
 #
 # Destination email address used solely for the interpolations in
 # jail.{conf,local} configuration files.
@@ -34,6 +36,13 @@ sender = fail2ban@blunderer.org
 [sshd]
 enabled  = true
 maxretry = 3
+
+[postfix-sasl]
+enabled  = true
+port     = smtp,smtps,submission,imaps
+logpath  = /var/log/docklog/postfix/mail.warn
+maxretry = 3
+
 
 # Jail for more extended banning of persistent abusers
 # !!! WARNING !!!
