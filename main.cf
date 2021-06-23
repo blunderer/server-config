@@ -77,11 +77,3 @@ milter_protocol = 2
 milter_default_action = accept
 smtpd_milters = inet:@myopendkim@:12301
 non_smtpd_milters = inet:@myopendkim@:12301
-
-#
-# SRS
-#
-sender_canonical_maps = tcp:127.0.0.1:10001
-sender_canonical_classes = envelope_sender
-recipient_canonical_maps = tcp:127.0.0.1:10002
-recipient_canonical_classes = envelope_recipient
