@@ -71,9 +71,9 @@ virtual_alias_domains = lelong.xyz n.lelong.xyz rion.lelong.xyz blunderer.org li
 virtual_alias_maps = hash:/etc/postfix/virtual
 
 #
-# DKIM
+# DKIM/ARC
 #
 milter_protocol = 2
 milter_default_action = accept
-smtpd_milters = inet:@myopendkim@:12301
-non_smtpd_milters = inet:@myopendkim@:12301
+smtpd_milters = inet:@myopendkim@:12301 inet:@myopendkim@:12302
+non_smtpd_milters = inet:@myopendkim@:12301 inet:@myopendkim@:12302
