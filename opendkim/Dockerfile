@@ -7,9 +7,10 @@ MAINTAINER Tristan Lelong
 
 EXPOSE 12301
 
-# Install required packages.
-RUN export DEBIAN_FRONTEND=noninteractive && \
-	apt-get update && \
+ENV DEBIAN_FRONTEND="noninteractive"
+
+# Install required packages
+RUN apt-get update && \
 	apt-get install -y supervisor \
 		opendkim \
 		opendkim-tools && \

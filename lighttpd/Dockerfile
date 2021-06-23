@@ -8,9 +8,10 @@ MAINTAINER Tristan Lelong
 EXPOSE 80
 EXPOSE 443
 
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install required packages.
-RUN export DEBIAN_FRONTEND=noninteractive && \
-	apt-get update && \
+RUN apt-get update && \
 	apt-get install -y lighttpd \
 		php \
 		php-cgi \
@@ -39,8 +40,7 @@ RUN echo "extension=mcrypt.so" >> /etc/php/7.3/cli/conf.d/20-mcrypt.ini && \
 	echo "extension=mcrypt.so" >> /etc/php/7.3/cgi/conf.d/20-mcrypt.ini
 
 # Cleanup unneeded files
-RUN export DEBIAN_FRONTEND=noninteractive && \
-	apt-get remove -y php-dev && \
+RUN apt-get remove -y php-dev && \
 	apt-get autoremove -y && \
 	apt-get clean
 

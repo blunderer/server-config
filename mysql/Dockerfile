@@ -7,9 +7,10 @@ MAINTAINER Tristan Lelong
 
 EXPOSE 3306
 
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install required packages
-RUN export DEBIAN_FRONTEND=noninteractive && \
-	apt-get update && \
+RUN apt-get update && \
 	apt-get install -y mariadb-server && \
 	apt-get clean
 

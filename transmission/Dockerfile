@@ -7,13 +7,16 @@ MAINTAINER Tristan Lelong
 
 EXPOSE 9091
 
+ENV DEBIAN_FRONTEND="noninteractive"
+
 # Install required packages.
-RUN export DEBIAN_FRONTEND=noninteractive && \
-	apt-get update && \
+RUN apt-get update && \
 	apt-get install -y transmission-daemon \
 		transmission-cli \
-		transmission && \
-	apt-get clean
+		transmission
+
+# Cleanup rootfs
+RUN apt-get clean
 
 # Set timezone
 RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime

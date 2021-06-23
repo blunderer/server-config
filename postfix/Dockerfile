@@ -9,15 +9,18 @@ EXPOSE 25
 EXPOSE 465
 EXPOSE 587
 
+ENV DEBIAN_FRONTEND="noninteractive"
+
 # Install required packages.
-RUN export DEBIAN_FRONTEND=noninteractive && \
-	apt-get update && \
+RUN apt-get update && \
 	apt-get install -y supervisor \
 		postfix \
 		sasl2-bin \
-		telnet \
 		postsrsd && \
-	apt-get clean
+		telnet
+
+# Cleanup rootfs
+RUN apt-get clean
 
 # Set timezone
 RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime

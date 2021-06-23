@@ -5,10 +5,10 @@
 FROM debian:latest
 MAINTAINER Tristan Lelong
 
-# Install required packages.
-RUN export DEBIAN_FRONTEND=noninteractive && \
-	apt-get update && \
-	apt-get clean
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Cleanup rootfs
+RUN apt-get clean
 
 # Set timezone
 RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
