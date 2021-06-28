@@ -14,6 +14,9 @@ chmod 640 /etc/shadow
 # Resolve opendkim address
 sed -i "s/@myopendkim@/$MYOPENDKIM_PORT_12301_TCP_ADDR/g" /etc/postfix/main.cf
 
+# Update server name
+sed -i "s/@server_name@/$server_name/g" /etc/postfix/main.cf
+
 # Set permissions
 chown -R postfix.postfix /keys
 
