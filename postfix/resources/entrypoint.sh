@@ -12,7 +12,7 @@ chmod 644 /etc/passwd /etc/group
 chmod 640 /etc/shadow
 
 # Resolve opendkim address
-sed -i "s/@myopendkim@/$MYOPENDKIM_PORT_12301_TCP_ADDR/" /etc/postfix/main.cf
+sed -i "s/@myopendkim@/$MYOPENDKIM_PORT_12301_TCP_ADDR/g" /etc/postfix/main.cf
 
 # Set permissions
 chown -R postfix.postfix /keys
