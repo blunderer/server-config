@@ -16,7 +16,6 @@ RUN apt-get update && \
 	apt-get install -y supervisor \
 		postfix \
 		sasl2-bin \
-		postsrsd && \
 		telnet
 
 # Cleanup rootfs
