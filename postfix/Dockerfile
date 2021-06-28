@@ -16,6 +16,7 @@ RUN apt-get update && \
 	apt-get install -y supervisor \
 		postfix \
 		sasl2-bin \
+		libsasl2-modules \
 		telnet
 
 # Cleanup rootfs
@@ -25,11 +26,10 @@ RUN apt-get clean
 RUN cp /usr/share/zoneinfo/Europe/Paris /etc/localtime
 
 # Copy configuration
-RUN rm -rf /etc/postfix/* && \
+RUN mv /etc/postfix /etc/postfix.orig && \
 	mkdir -p /var/lib/etc/ && \
-	mkdir -p /var/spool/postfix/var/run/saslauthd && \
 	echo "blunderer.org" > /etc/mailname
-COPY config/ /etc/postfix/
+COPY config /etc/postfix
 COPY supervisord.conf /etc/default/
 
 # Set UID/GID
