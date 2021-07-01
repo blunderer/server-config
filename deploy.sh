@@ -182,10 +182,19 @@ if has_to_run "stop"; then
 fi
 
 if has_to_run "cleanup"; then
-	echo "START CLEANUP"
+	unused_containers=$(docker ps -a | grep Exited | awk '{print $NF}' | grep -v -e "^old_" -e "^my")
+	echo "START CLEANUP OF OLD CONTAINERS"
+	echo "$unused_containers"
 	echo "Press any key to continue"
 	read
+	if [ -n "unused_containers" ]; then
+		docker rm $unused_containers
+	fi
 	unused_images=$(docker images | grep none | awk '{print $3}' | xargs)
+	echo "START CLEANUP OF OLD IMAGES"
+	echo "$unused_images"
+	echo "Press any key to continue"
+	read
 	if [ -n "unused_images" ]; then
 		docker rmi $unused_images
 	fi
