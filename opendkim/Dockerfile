@@ -27,7 +27,8 @@ RUN apt-get update && \
 	apt-get install -y supervisor \
 		opendkim \
 		openarc \
-		opendkim-tools
+		opendkim-tools \
+		netcat
 
 # Cleanup rootfs
 RUN apt-get remove -y gnupg && \

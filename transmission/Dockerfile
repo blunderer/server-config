@@ -13,7 +13,8 @@ ENV DEBIAN_FRONTEND="noninteractive"
 RUN apt-get update && \
 	apt-get install -y transmission-daemon \
 		transmission-cli \
-		transmission
+		transmission \
+		wget
 
 # Cleanup rootfs
 RUN apt-get clean

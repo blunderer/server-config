@@ -13,6 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Install required packages.
 RUN apt-get update && \
 	apt-get install -y lighttpd \
+		wget \
 		php \
 		php-cgi \
 		php-cli \
