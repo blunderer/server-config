@@ -1,6 +1,6 @@
 IMAGE="lighttpd:latest"
 NAME="lighttpd"
 PORTS="80:80/tcp 443:443/tcp"
-VOLUMES="www:/www keys/lighttpd:/keys:ro /var/log/docklog/lighttpd:/var/log:rw"
+VOLUMES="/etc/server-config:/env:ro www:/www keys/lighttpd:/keys:ro /var/log/docklog/lighttpd:/var/log:rw"
 DEPENDS="mysql"
 OPTIONS=""
