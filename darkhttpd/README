@@ -1,0 +1,6 @@
+IMAGE="darkhttpd:latest"
+NAME="darkhttpd"
+PORTS=""
+VOLUMES="/etc/server-config:/env:ro www/:/www keys/tor:/var/lib/tor/home/ /var/log/docklog/darkhttpd:/var/log:rw"
+DEPENDS=""
+OPTIONS=""
