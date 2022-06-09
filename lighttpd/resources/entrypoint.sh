@@ -10,6 +10,11 @@ if [ -n "$1" ]; then
 	exec $*
 fi
 
+source /env
+
+# Customize lighttpd config
+sed -i "s/@onion_name@/$onion_name/" /etc/lighttpd/lighttpd.conf
+
 # Set permissions
 chown -R www-data.www-data /www
 
