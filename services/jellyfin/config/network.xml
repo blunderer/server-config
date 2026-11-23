@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Canonical Jellyfin network configuration, installed into
+     /config/network.xml on every start by entrypoint.sh. KnownProxies
+     trusts the srv-web Docker network so Jellyfin honours X-Forwarded-For and
+     X-Forwarded-Proto from nginx instead of treating proxied internet and
+     Chromecast requests as plain-HTTP LAN traffic from nginx's IP. -->
+<NetworkConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <BaseUrl />
+  <EnableHttps>false</EnableHttps>
+  <RequireHttps>false</RequireHttps>
+  <CertificatePath />
+  <CertificatePassword />
+  <InternalHttpPort>8096</InternalHttpPort>
+  <InternalHttpsPort>8920</InternalHttpsPort>
+  <PublicHttpPort>8096</PublicHttpPort>
+  <PublicHttpsPort>8920</PublicHttpsPort>
+  <AutoDiscovery>true</AutoDiscovery>
+  <EnableUPnP>false</EnableUPnP>
+  <EnableIPv4>true</EnableIPv4>
+  <EnableIPv6>true</EnableIPv6>
+  <EnableRemoteAccess>true</EnableRemoteAccess>
+  <LocalNetworkSubnets />
+  <LocalNetworkAddresses>
+    <string>::</string>
+  </LocalNetworkAddresses>
+  <KnownProxies>
+    <string>@podman_web_subnet@</string>
+    <string>@podman_web_subnet6@</string>
+  </KnownProxies>
+  <IgnoreVirtualInterfaces>true</IgnoreVirtualInterfaces>
+  <VirtualInterfaceNames>
+    <string>veth</string>
+  </VirtualInterfaceNames>
+  <EnablePublishedServerUriByRequest>false</EnablePublishedServerUriByRequest>
+  <PublishedServerUriBySubnet />
+  <RemoteIPFilter />
+  <IsRemoteIPFilterBlacklist>false</IsRemoteIPFilterBlacklist>
+</NetworkConfiguration>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Seeded into /config/encoding.xml on first boot; on existing installs
+     entrypoint.sh enforces EncoderPreset=ultrafast in place so any other
+     transcoding settings are preserved. Jellyfin's default "auto" maps to
+     libx264 veryfast, which runs below 1.0x real-time on pre-SSE4.1 CPUs. -->
+<EncodingOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <EncoderPreset>ultrafast</EncoderPreset>
+</EncodingOptions>

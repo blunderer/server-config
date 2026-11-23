@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Mount Jellyfin's writable overlay over <torrent_dir>/downloads, keeping the
+# downloads folder (or partition) read-only; writes land in
+# <volumes_dir>/jellyfin-overlay/overlay/downloads/upper.
+set -euo pipefail
+
+lower=$(realpath -e "${SRV_V_torrent_dir:?torrent_dir is not set}/downloads") || {
+	echo "jellyfin: ${SRV_V_torrent_dir}/downloads does not exist" >&2
+	exit 1
+}
+[[ -d $lower ]] || { echo "jellyfin: $lower is not a folder" >&2; exit 1; }
+[[ $lower != *[,:]* ]] || {
+	echo "jellyfin: $lower: path with , or : cannot be an overlay lowerdir" >&2
+	exit 1
+}
+
+cur_env="${SRV_STATE:-/srv/releases}/jellyfin/current/.env"
+if [[ -z ${SRV_RELEASE_DIR:-} && -f $cur_env ]]; then
+	rvols=$(sed -n 's/^SRV_VOLUMES=//p' "$cur_env" | tail -n 1)
+	if [[ -n $rvols ]]; then
+		base=$rvols/jellyfin-overlay
+	else
+		base=${SRV_V_jellyfin_overlay_dir:-/home/srv-jellyfin}
+	fi
+else
+	base=${SRV_VOLUMES:-${SRV_V_volumes_dir:-/home/volumes}}/jellyfin-overlay
+fi
+[[ $base != *[,:]* ]] || {
+	echo "jellyfin: $base: path with , or : cannot hold an overlay" >&2
+	exit 1
+}
+merged=$base/mnt/downloads
+up=$base/overlay/downloads/upper
+wk=$base/overlay/downloads/work
+
+if mountpoint -q "$merged"; then
+	echo "jellyfin: overlay already mounted on $merged ($lower)"
+	exit 0
+fi
+
+rm -rf "$wk"
+mkdir -p "$merged" "$up" "$wk"
+# Jellyfin runs as uid 1000; overlayfs takes the merged root's owner from upperdir.
+chown 1000:1000 "$up"
+
+mount -t overlay overlay -o "lowerdir=$lower,upperdir=$up,workdir=$wk" "$merged"
+echo "jellyfin: $lower mounted through overlay on $merged (upper: $up)"
+
+# After a reboot, Podman may start Jellyfin before @reboot cron mounts the
+# overlay: rslave exposes the mount at /data/downloads, and restarting the
+# container re-attaches Jellyfin's directory watcher to the mounted root.
+# shellcheck source=lib/runtime.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/runtime.sh"
+if rt_uctl is-active --quiet srv-jellyfin.service 2>/dev/null; then
+	rt_uctl restart srv-jellyfin.service >/dev/null
+	echo "jellyfin: restarted running service so /data/downloads watchers attach to the overlay"
+fi

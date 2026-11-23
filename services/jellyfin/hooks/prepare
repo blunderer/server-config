@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Before the containers are created: the state folder and the writable overlay
+# over <torrent_dir>/downloads.
+set -euo pipefail
+# Files created here belong to the data folder's owner, not root.
+# shellcheck source=lib/data-owner.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/data-owner.sh"
+data_owner_init "$SRV_DATA"
+
+mkdir_own "$SRV_DATA/jellyfin"
+
+if [[ ! -d ${SRV_V_torrent_dir:?}/downloads ]]; then
+	mkdir_own "$SRV_V_torrent_dir/downloads"
+	echo "created $SRV_V_torrent_dir/downloads"
+fi
+
+"$(dirname "$0")/mount"

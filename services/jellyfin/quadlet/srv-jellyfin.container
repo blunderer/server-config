@@ -1,0 +1,49 @@
+[Unit]
+Description=Jellyfin media server (linuxserver image)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=srv-jellyfin
+Image=localhost/srv/jellyfin:${SRV_RELEASE}
+Entrypoint=/etc/srv/jellyfin/entrypoint.sh
+Network=srv-web.network
+NetworkAlias=jellyfin
+UserNS=keep-id
+User=0:0
+DropCapability=ALL
+AddCapability=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+PidsLimit=512
+Environment=TZ=${SRV_TZ}
+Environment=PUID=1000
+Environment=PGID=1000
+Environment=JELLYFIN_PublishedServerUrl=https://jellyfin.blunderer.org
+Volume=${SRV_RELEASE_DIR}/config:/etc/srv/jellyfin:ro
+# Jellyfin state (users, database, metadata); per host (not replicated).
+Volume=${SRV_DATA}/jellyfin:/config
+# Writable overlay over @torrent_dir@/downloads (hooks/mount); rslave so
+# remounts on the host appear in /data/downloads without recreating.
+Volume=${SRV_VOLUMES}/jellyfin-overlay/mnt:/data:rslave
+# HTTP 200 covers Healthy and Degraded (e.g. a read-only library mount);
+# Jellyfin answers 503 while starting or unhealthy.
+HealthCmd=curl -fsS -o /dev/null http://127.0.0.1:8096/health
+HealthTimeout=10s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=2g --log-opt=tag=jellyfin
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=default.target

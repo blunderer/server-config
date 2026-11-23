@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Unmount Jellyfin's writable overlay over <torrent_dir>/downloads:
+#   srv hook jellyfin umount [discard]
+# Upper-layer changes stay in
+# <volumes_dir>/jellyfin-overlay/overlay/downloads/upper unless "discard"
+# deletes them. The downloads folder itself is never touched.
+set -euo pipefail
+
+cur_env="${SRV_STATE:-/srv/releases}/jellyfin/current/.env"
+if [[ -z ${SRV_RELEASE_DIR:-} && -f $cur_env ]]; then
+	rvols=$(sed -n 's/^SRV_VOLUMES=//p' "$cur_env" | tail -n 1)
+	if [[ -n $rvols ]]; then
+		base=$rvols/jellyfin-overlay
+	else
+		base=${SRV_V_jellyfin_overlay_dir:-/home/srv-jellyfin}
+	fi
+else
+	base=${SRV_VOLUMES:-${SRV_V_volumes_dir:-/home/volumes}}/jellyfin-overlay
+fi
+merged=$base/mnt/downloads
+
+if mountpoint -q "$merged"; then
+	umount "$merged" || {
+		echo "jellyfin: $merged is busy (stop jellyfin first: srv stop jellyfin)" >&2
+		exit 1
+	}
+	echo "jellyfin: unmounted $merged"
+else
+	echo "jellyfin: $merged was not mounted"
+fi
+
+if [[ ${1:-} == discard ]]; then
+	rm -rf "${base:?}/overlay/downloads"
+	echo "jellyfin: discarded overlay changes in $base/overlay/downloads"
+elif [[ -d $base/overlay/downloads/upper ]]; then
+	echo "jellyfin: changes kept in $base/overlay/downloads/upper"
+fi

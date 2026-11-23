@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Seeded into /config/system.xml on first boot; on existing installs
+     entrypoint.sh enforces EnableLegacyAuthorization=true in place so
+     runtime state (IsStartupWizardCompleted, UI preferences) is kept.
+     Jellyfin 10.12+ disables legacy X-Emby-* / api_key authorization by
+     default, which breaks Chromecast receiver session setup. -->
+<ServerConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <EnableLegacyAuthorization>true</EnableLegacyAuthorization>
+  <IsStartupWizardCompleted>false</IsStartupWizardCompleted>
+</ServerConfiguration>
