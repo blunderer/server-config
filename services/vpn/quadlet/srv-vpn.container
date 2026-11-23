@@ -1,0 +1,46 @@
+[Unit]
+Description=WireGuard VPN (linuxserver image)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=srv-vpn
+Image=lscr.io/linuxserver/wireguard:1.0.20260223@sha256:10db56ad834f94541307d5dfdbe87370e26d155bb341a5bf65789f970f24ab5c
+Network=pasta
+UserNS=keep-id
+User=0:0
+DropCapability=ALL
+AddCapability=CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+PidsLimit=128
+Sysctl=net.ipv4.conf.all.src_valid_mark=1
+PublishPort=51820:51820/udp
+Environment=TZ=${SRV_TZ}
+Environment=PUID=1000
+Environment=PGID=1000
+Environment=SERVERURL=@server_name@
+Environment=SERVERPORT=51820
+Environment="PEERS=@wg_peers@"
+Environment=PEERDNS=auto
+Environment=INTERNAL_SUBNET=10.13.13.0
+Volume=${SRV_DATA}/wireguard:/config
+HealthCmd=wg show wg0
+HealthTimeout=10s
+HealthRetries=2
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=256m --log-opt=tag=vpn
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+OOMScoreAdjust=-300
+
+[Install]
+WantedBy=default.target
