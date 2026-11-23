@@ -1,0 +1,57 @@
+[Unit]
+Description=Private Minecraft Bedrock server (Switch, phones, Xbox, Windows)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=srv-minecraft
+Image=docker.io/itzg/minecraft-bedrock-server:2026.11.0@sha256:0d8799379a492bd636037587298fa8a77ee409264fd77a3c68dba55104dbcca0
+Network=pasta
+UserNS=keep-id
+User=0:0
+DropCapability=ALL
+AddCapability=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_SYS_PTRACE
+NoNewPrivileges=true
+PidsLimit=256
+StopTimeout=60
+PublishPort=19132:19132/tcp
+PublishPort=19132:19132/udp
+PublishPort=19133:19133/udp
+PublishPort=19140-19155:19140-19155/udp
+Environment=TZ=${SRV_TZ}
+Environment=EULA=TRUE
+Environment=VERSION=LATEST
+Environment=SERVER_UDP_PORTS=@host_ip@:19140-19155:19140-19155
+Environment="SERVER_NAME=@minecraft_name@"
+Environment=GAMEMODE=@minecraft_gamemode@
+Environment=DIFFICULTY=@minecraft_difficulty@
+Environment=MAX_PLAYERS=@minecraft_max_players@
+Environment=ONLINE_MODE=true
+Environment=ALLOW_LIST=true
+Environment=VIEW_DISTANCE=10
+Environment=TICK_DISTANCE=4
+Environment=DEFAULT_PLAYER_PERMISSION_LEVEL=member
+# World, settings, allow list; per host (not pushed to other hosts).
+Volume=${SRV_DATA}/minecraft:/data
+HealthCmd=mc-monitor status-bedrock --host 127.0.0.1 --port 19132
+HealthTimeout=10s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=5m
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+# Keep stdin open so send-command (box minecraft) can write to PID 1.
+PodmanArgs=-i -t --memory=1536m --log-opt=tag=minecraft
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=600
+TimeoutStopSec=75
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=default.target

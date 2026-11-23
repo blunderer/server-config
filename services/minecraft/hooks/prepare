@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Before the containers are created: the world folder, owned by the data
+# folder's owner (the image runs the server as the owner of /data).
+set -euo pipefail
+# shellcheck source=lib/data-owner.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/data-owner.sh"
+data_owner_init "$SRV_DATA"
+mkdir_own "$SRV_DATA/minecraft"
