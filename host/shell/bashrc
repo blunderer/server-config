@@ -1,0 +1,124 @@
+# ~/.bashrc: interactive shells. Installed by box (host/shell/bashrc), the
+# same on every host and for root and the admin account; changes here are
+# overwritten by the next box setup. Put per-host or personal additions in
+# ~/.bashrc.local.
+
+# Not interactive (scp, rsync, ssh host command): nothing to do.
+case $- in
+	*i*) ;;
+	*) return ;;
+esac
+
+# --- History: shared across sessions, with dates, no duplicates -------------
+HISTCONTROL=ignoreboth:erasedups
+HISTSIZE=10000
+HISTFILESIZE=20000
+HISTTIMEFORMAT='%F %T  '
+shopt -s histappend checkwinsize
+PROMPT_COMMAND='history -a'
+
+# --- Prompt: user@host:dir, the host in its own colour ----------------------
+# Each host of the inventory gets its own colour (by its place in hosts=), so
+# a window on the wrong server stands out; root's name is red; "leader"
+# marks the srv leader. srv is asked once, when the shell starts.
+__srv_colours=(36 33 35 94 92 96 93 95)
+__srv_host=${HOSTNAME%%.*} __srv_role='' __srv_c=''
+if command -v srv >/dev/null 2>&1; then
+	[ "$(srv get is_leader no 2>/dev/null)" = yes ] && __srv_role=' leader'
+	__srv_i=0
+	for __srv_h in $(srv get hosts '' 2>/dev/null); do
+		[ "$__srv_h" = "$__srv_host" ] && __srv_c=${__srv_colours[__srv_i % ${#__srv_colours[@]}]}
+		__srv_i=$((__srv_i + 1))
+	done
+fi
+# Not in the inventory: a colour from the name.
+[ -n "$__srv_c" ] || __srv_c=${__srv_colours[$(printf '%s' "$__srv_host" | cksum | cut -d' ' -f1) % ${#__srv_colours[@]}]}
+if [ "$EUID" -eq 0 ]; then __srv_user=31; else __srv_user=32; fi
+PS1='\[\e[01;'"$__srv_user"'m\]\u\[\e[0m\]@\[\e[01;'"$__srv_c"'m\]\h\[\e[0m\]\[\e[2m\]'"$__srv_role"'\[\e[0m\]:\[\e[01;34m\]\w\[\e[0m\]\$ '
+# Terminal and tmux window title: user@host: dir
+case "$TERM" in
+	xterm* | rxvt* | tmux* | screen*) PS1='\[\e]0;\u@\h: \w\a\]'"$PS1" ;;
+esac
+unset __srv_colours __srv_host __srv_role __srv_c __srv_i __srv_h __srv_user
+
+# --- Tools ---------------------------------------------------------------
+export EDITOR=vim VISUAL=vim PAGER=less LESS=-R
+if [ -x /usr/bin/dircolors ]; then
+	eval "$(dircolors -b)"
+	alias ls='ls --color=auto'
+	alias grep='grep --color=auto'
+fi
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+# The services' logs, the way srv writes them (journald, one tag per container).
+alias jl='journalctl -e -t'
+
+__box_logout_cleanup() {
+	if [ -n "${__BOX_SUDO_LOGGED_IN:-}" ]; then
+		sudo -k 2>/dev/null || true
+		unset __BOX_SUDO_LOGGED_IN
+	fi
+	if [ -n "${__BOX_SSH_AGENT_PID:-}" ]; then
+		SSH_AGENT_PID="$__BOX_SSH_AGENT_PID" ssh-agent -k >/dev/null 2>&1 || true
+		unset __BOX_SSH_AGENT_PID SSH_AGENT_PID
+		if [ -n "${__BOX_PREV_SSH_AUTH_SOCK:-}" ]; then
+			export SSH_AUTH_SOCK="$__BOX_PREV_SSH_AUTH_SOCK"
+		else
+			unset SSH_AUTH_SOCK
+		fi
+		unset __BOX_PREV_SSH_AUTH_SOCK
+	fi
+}
+
+# Allow `box go` to cd, and `box login`/`box logout` to cache sudo and manage
+# a session-scoped ssh-agent that cleans up automatically on disconnect.
+box() {
+	if [ "${1:-}" = go ] && [ $# -eq 1 ]; then
+		local _d
+		_d=$(command box go) && cd "$_d" || return
+		return 0
+	fi
+	if [ "${1:-}" = login ]; then
+		local _want_ssh=0 _started=0 _a
+		for _a in "$@"; do
+			case "$_a" in
+				-s | --ssh) _want_ssh=1 ;;
+			esac
+		done
+		if [ "$_want_ssh" -eq 1 ]; then
+			if [ -z "${__BOX_SSH_AGENT_PID:-}" ] || ! kill -0 "$__BOX_SSH_AGENT_PID" 2>/dev/null; then
+				__BOX_PREV_SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}"
+				eval "$(ssh-agent -s)" >/dev/null || return 1
+				__BOX_SSH_AGENT_PID="$SSH_AGENT_PID"
+				_started=1
+			fi
+		fi
+		if ! command box "$@"; then
+			[ "$_started" -eq 1 ] && __box_logout_cleanup
+			return 1
+		fi
+		__BOX_SUDO_LOGGED_IN=1
+		trap '__box_logout_cleanup' EXIT HUP
+		return 0
+	fi
+	if [ "${1:-}" = logout ] && [ $# -eq 1 ]; then
+		command box logout
+		__box_logout_cleanup
+		return 0
+	fi
+	command box "$@"
+}
+
+# Completion (bash-completion, if installed, plus srv/box/remote completion).
+if ! shopt -oq posix && [ -f /usr/share/bash-completion/bash_completion ]; then
+	. /usr/share/bash-completion/bash_completion
+fi
+if ! shopt -oq posix && command -v srv >/dev/null 2>&1; then
+	__srv_comp="$(dirname "$(readlink -f "$(command -v srv)")")/host/shell/completion.bash"
+	[ -r "$__srv_comp" ] && . "$__srv_comp"
+	unset __srv_comp
+fi
+
+[ -f "$HOME/.bash_aliases" ] && . "$HOME/.bash_aliases"
+[ -f "$HOME/.bashrc.local" ] && . "$HOME/.bashrc.local"

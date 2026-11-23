@@ -1,0 +1,13 @@
+# ~/.profile: login shells. Installed by box (host/shell/profile), the same on
+# every host and for root and the admin account; changes here are overwritten
+# by the next box setup. Put per-host or personal additions in ~/.profile.local.
+
+# Interactive bash: everything else is in ~/.bashrc.
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+	. "$HOME/.bashrc"
+fi
+
+[ -d "$HOME/bin" ] && PATH="$HOME/bin:$PATH"
+[ -d "$HOME/.local/bin" ] && PATH="$HOME/.local/bin:$PATH"
+
+[ -f "$HOME/.profile.local" ] && . "$HOME/.profile.local"
