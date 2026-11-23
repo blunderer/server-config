@@ -1,0 +1,18 @@
+[Unit]
+Description=Web stack pod (nginx, PHP-FPM, Google SSO)
+Wants=network-online.target
+After=network-online.target
+
+[Pod]
+PodName=srv-web
+Network=srv-web.network
+Network=srv-db.network
+# Pin MariaDB's static IP directly so PHP never hits aardvark-dns multi-network NXDOMAIN.
+AddHost=mymysql:@podman_db_ip@
+AddHost=mysql:@podman_db_ip@
+PublishPort=80:80
+PublishPort=443:443
+UserNS=keep-id
+
+[Install]
+WantedBy=default.target

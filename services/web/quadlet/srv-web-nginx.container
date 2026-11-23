@@ -1,0 +1,46 @@
+[Unit]
+Description=Web reverse proxy (nginx)
+Wants=srv-web-php.service srv-web-oauth2-proxy.service
+After=srv-web-php.service srv-web-oauth2-proxy.service
+
+[Container]
+ContainerName=srv-web-nginx
+Pod=srv-web.pod
+Image=docker.io/library/nginx:1.30-alpine@sha256:583b7f2fce1cdb8da5ad5c39ebd3c33b98b87d493190e548bdee1fa8c619c311
+User=0:0
+GroupAdd=1000
+DropCapability=ALL
+AddCapability=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+PidsLimit=256
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_RELEASE_DIR}/config/nginx.conf:/etc/nginx/nginx.conf:ro
+Volume=${SRV_RELEASE_DIR}/config/sites:/etc/nginx/sites:ro
+Volume=${SRV_RELEASE_DIR}/config/snippets:/etc/nginx/snippets:ro
+Volume=${SRV_RELEASE_DIR}/config/entrypoint.d/50-srv-onion-socket.sh:/docker-entrypoint.d/50-srv-onion-socket.sh:ro
+Volume=${SRV_RELEASE_DIR}/config/entrypoint.d/60-srv-websso-map.sh:/docker-entrypoint.d/60-srv-websso-map.sh:ro
+Volume=${SRV_DATA}/www:/www:ro
+Volume=${SRV_DATA}/users/websso:/users/websso:ro
+# Unix socket shared with the onion service (tor connects to it).
+Volume=${SRV_VOLUMES}/onion:/run/onion
+Secret=srv-ssl-cert,type=mount,target=/keys/ssl/blunderer.org/fullchain.crt,mode=0444,uid=0,gid=0
+Secret=srv-ssl-key,type=mount,target=/keys/ssl/blunderer.org/blunderer.org.key,mode=0400,uid=0,gid=0
+HealthCmd=sh -c 'wget -q -O /dev/null http://127.0.0.1:8081/healthz && wget -q -O /dev/null http://127.0.0.1:4180/ping'
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=256m --log-opt=tag=web
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

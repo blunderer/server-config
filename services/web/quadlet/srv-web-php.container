@@ -1,0 +1,34 @@
+[Unit]
+Description=PHP-FPM for websites
+
+[Container]
+ContainerName=srv-web-php
+Pod=srv-web.pod
+Image=localhost/srv/web-php:${SRV_RELEASE}
+# Site files in <data>/www belong to uid 1000.
+User=1000:1000
+DropCapability=ALL
+NoNewPrivileges=true
+PidsLimit=256
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_DATA}/www:/www
+Volume=${SRV_RELEASE_DIR}/config/php/srv.ini:/etc/php/8.4/fpm/conf.d/99-srv.ini:ro
+HealthCmd=php -r 'exit(@fsockopen("127.0.0.1", 9000) ? 0 : 1);'
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=512m --log-opt=tag=web-php
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

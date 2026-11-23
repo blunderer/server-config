@@ -1,0 +1,27 @@
+[Unit]
+Description=Google SSO proxy (oauth2-proxy)
+
+[Container]
+ContainerName=srv-web-oauth2-proxy
+Pod=srv-web.pod
+Image=quay.io/oauth2-proxy/oauth2-proxy:v7.15.6@sha256:c3415e8660af553f5e18f5d90db050614c02493c0ac6260ac59442f6d9b12048
+User=1000:1000
+DropCapability=ALL
+NoNewPrivileges=true
+ReadOnly=true
+PidsLimit=128
+Environment=TZ=${SRV_TZ}
+Exec=--config=/etc/oauth2-proxy/oauth2.cfg --provider=google --prompt=select_account --http-address=127.0.0.1:4180 --upstream=static://202 --cookie-domain=.@domain@ --whitelist-domain=.@domain@ --email-domain=* --reverse-proxy=true --trusted-proxy-ip=10.0.0.0/8 --trusted-proxy-ip=172.16.0.0/12 --trusted-proxy-ip=192.168.0.0/16 --trusted-proxy-ip=fc00::/7 --code-challenge-method=S256 --set-xauthrequest=true --session-cookie-minimal=true --cookie-name=__Secure-srv_sso --cookie-secure=true --cookie-httponly=true --cookie-samesite=lax --skip-provider-button=true --silence-ping-logging=true
+Secret=srv-websso-cfg,type=mount,target=/etc/oauth2-proxy/oauth2.cfg,mode=0400,uid=1000,gid=1000
+LogDriver=journald
+PodmanArgs=--memory=128m --log-opt=tag=web-sso
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

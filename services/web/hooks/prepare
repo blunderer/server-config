@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Before the containers are created: ensure <data>/users/websso exists and
+# check the Google SSO secrets in <data>/keys/websso/oauth2.cfg (box keys).
+set -euo pipefail
+# Files created here belong to the data folder's owner, not root.
+# shellcheck source=lib/data-owner.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/data-owner.sh"
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/runtime.sh"
+data_owner_init "$SRV_DATA"
+install -d -m 0755 -o "$(rt_keepid_id uid 0)" -g "$(rt_keepid_id gid 0)" "${SRV_VOLUMES:?}/onion"
+
+keys="$SRV_DATA/keys/websso"
+users="$SRV_DATA/users/websso"
+cfg="$keys/oauth2.cfg"
+mkdir_own "$users"
+chmod 750 "$users"
+find "$users" -maxdepth 1 -type f -exec chmod 640 {} +
+
+cfg_val() {
+	[[ -f $cfg ]] || return 0
+	sed -nE "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\1/p" "$cfg" 2>/dev/null | head -n 1
+}
+
+if [[ ! -s $cfg || -z $(cfg_val client_id) || -z $(cfg_val client_secret) || -z $(cfg_val cookie_secret) ]]; then
+	cat >&2 <<-EOF
+		web: Google SSO credentials are missing or incomplete ($cfg).
+		  Run on the leader: sudo box keys new websso   (see: box keys help websso)
+	EOF
+	exit 1
+fi
+
+downer=$(stat -c %u "$keys")
+dmode=$(stat -c %a "$keys")
+if [[ ($downer != 1000 && $downer != 0) ]] || (((8#$dmode & 8#077) != 0)); then
+	echo "web: unsafe key directory $keys (uid $downer, mode $dmode; expected uid 0 or 1000 and mode 0700)" >&2
+	exit 1
+fi
+
+owner=$(stat -c %u "$cfg")
+mode=$(stat -c %a "$cfg")
+if [[ ($owner != 1000 && $owner != 0) ]] || (((8#$mode & 8#077) != 0)); then
+	echo "web: unsafe key file $cfg (uid $owner, mode $mode; expected uid 0 or 1000 and mode 0600)" >&2
+	exit 1
+fi
