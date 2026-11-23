@@ -1,0 +1,32 @@
+# fail2ban jails (installed to /etc/fail2ban/jail.local).
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 3
+# sshd and the containers log to journald.
+backend  = systemd
+banaction = iptables-multiport
+banaction_allports = iptables-allports
+destemail = root@localhost
+sender = fail2ban@localhost
+
+[sshd]
+enabled = true
+# sshd runs on the host: default INPUT chain.
+
+[srv-postfix-sasl]
+enabled  = true
+filter   = srv-postfix-sasl
+port     = smtp,submission,submissions
+# Rootless Podman ports terminate on the host via INPUT; when Docker is also
+# active, /etc/fail2ban/jail.d/srv-docker.local adds DOCKER-USER.
+chain    = INPUT
+
+[recidive]
+enabled  = true
+backend  = auto
+logpath  = /var/log/fail2ban.log
+bantime  = 1w
+findtime = 1d
+maxretry = 2
+action   = iptables-allports[name=recidive-host, chain=INPUT]
