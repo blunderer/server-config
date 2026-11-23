@@ -1,0 +1,38 @@
+[Unit]
+Description=Tor onion service for the website
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=srv-onion
+Image=localhost/srv/onion-tor:${SRV_RELEASE}
+Network=pasta
+UserNS=keep-id
+User=1000:1000
+DropCapability=ALL
+NoNewPrivileges=true
+PidsLimit=128
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_RELEASE_DIR}/config/torrc:/etc/tor/torrc:ro
+Volume=${SRV_VOLUMES}/onion-state:/var/lib/tor
+Volume=${SRV_DATA}/keys/tor:/var/lib/tor/hs
+Volume=${SRV_VOLUMES}/onion:/run/onion
+HealthCmd=/usr/local/bin/srv-tor-health @onion_name@
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=30s
+HealthStartPeriod=120s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=256m --log-opt=tag=onion
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

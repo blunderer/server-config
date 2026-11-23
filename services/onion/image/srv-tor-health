@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+name=${1:?usage: srv-tor-health ONION_NAME}
+test -s "/var/lib/tor/hs/$name/hostname"
+test -s /var/lib/tor/control_auth_cookie
+exec 3<>/dev/tcp/127.0.0.1/9051
+{
+	printf 'AUTHENTICATE '
+	od -An -tx1 /var/lib/tor/control_auth_cookie | tr -d ' \n'
+	printf '\r\nGETINFO status/circuit-established\r\nQUIT\r\n'
+} >&3
+tr -d '\r' <&3 | grep -qx '250-status/circuit-established=1'

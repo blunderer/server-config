@@ -1,0 +1,11 @@
+# Tor configuration (rendered by srv).
+DataDirectory /var/lib/tor
+SocksPort 0
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+Log notice stdout
+
+# Keys and hostname of the onion service: <data>/keys/tor/@onion_name@/
+HiddenServiceDir /var/lib/tor/hs/@onion_name@/
+# The web service serves the onion site on this socket.
+HiddenServicePort 80 unix:/run/onion/web.sock

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Before the containers are created: Tor runs as uid 1000 and refuses a
+# DataDirectory (/var/lib/tor) readable by group or others.
+set -euo pipefail
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/runtime.sh"
+[[ -d ${SRV_VOLUMES:?}/onion ]] || install -d -m 0755 -o "$(rt_host_id uid 0)" -g "$(rt_host_id gid 0)" "${SRV_VOLUMES:?}/onion"
+install -d -m 0700 -o 1000 -g 1000 "$SRV_VOLUMES/onion-state" "$SRV_VOLUMES/onion-state/hs"
