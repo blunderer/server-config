@@ -1,0 +1,1705 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2015 # `test && ok || fail` reporting is intended
+#
+# box - set up, upgrade and check a host running srv.
+#
+#   box setup        everything, in order (idempotent: run it again any time)
+#   box check        is this host ready? (folders, files, services, disk...)
+#   box audit        what drifted (and which box command fixes it),
+#                         plus the attack surface (ports, services, packages)
+#
+# Every file box manages is produced by a gen_* function below; the
+# commands install that output and `audit` compares it with what is on disk.
+#
+# Host values come from the host env file (/etc/srv/host.env), read through
+# `srv get`. Run as root. `box help` lists every command.
+
+set -Eeuo pipefail
+
+REPO=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+SRV="$REPO/srv"
+# own/mkdir_own: what box creates in the data folder belongs to its owner.
+# shellcheck source=lib/data-owner.sh
+. "$REPO/lib/data-owner.sh"
+# runtime helpers: rootless Podman execution, user IDs, keep-id mapping.
+# shellcheck source=lib/runtime.sh
+. "$REPO/lib/runtime.sh"
+export SRV_HOST_ENV=${SRV_HOST_ENV:-/etc/srv/host.env}
+
+# Lazy loader for larger box libraries (lib/secrets.sh, lib/checks.sh,
+# lib/tools.sh, lib/keys.sh, lib/peer_health.sh, lib/distdeb.sh).
+declare -A _BOX_LOADED_LIBS=()
+load_lib() {
+	local name=$1
+	[[ -z ${_BOX_LOADED_LIBS[$name]+set} ]] || return 0
+	_BOX_LOADED_LIBS[$name]=1
+	# shellcheck source=/dev/null
+	. "$REPO/lib/$name.sh"
+}
+
+unix_role() { get unix_role; }
+admin_role() { get admin_role "$(unix_role)"; }
+runs() { [[ " $(get services) " == *" $1 "* ]]; }
+alerts_pw_file() { echo "$(get data_dir /home/data)/keys/alerts/smtp_password"; }
+alerts_account() {
+	if alerts_configured; then get alert_smtp_user alerts; fi
+}
+
+# The whole package set srv needs. Nothing else is installed by this script,
+# and recommends are disabled, to keep the attack surface small.
+PKG_BASE=(ca-certificates curl git rsync cron initramfs-tools iproute2 openssh-server fail2ban python3-systemd
+	systemd-timesyncd iptables msmtp tmux ncurses-term bind9-dnsutils vim openssh-client)
+PKG_PODMAN=(podman crun catatonit aardvark-dns uidmap slirp4netns passt fuse-overlayfs dbus-user-session)
+PKG_BASE+=(libpam-ssh-agent-auth)
+# Certificate renewal needs nothing on the host: lego runs from its image
+# (ssl/renew.sh).
+
+if [[ -t 1 ]]; then
+	C_RED=$'\e[31m' C_GRN=$'\e[32m' C_YLW=$'\e[33m' C_BLD=$'\e[1m' C_OFF=$'\e[0m'
+else
+	C_RED='' C_GRN='' C_YLW='' C_BLD='' C_OFF=''
+fi
+# -q (BOX_QUIET=1): no ok lines, and a section title only above a warning or
+# failure of that section.
+BOX_QUIET=${BOX_QUIET:-0} PENDING_SAY=''
+say() {
+	if [[ $BOX_QUIET == 1 ]]; then PENDING_SAY=$*; return; fi
+	printf '%s==>%s %s\n' "$C_BLD" "$C_OFF" "$*"
+}
+flush_say() {
+	[[ -n $PENDING_SAY ]] || return 0
+	printf '%s==>%s %s\n' "$C_BLD" "$C_OFF" "$PENDING_SAY"
+	PENDING_SAY=''
+}
+ok()   { [[ $BOX_QUIET == 1 ]] || printf '  %sok%s   %s\n' "$C_GRN" "$C_OFF" "$*"; }
+warn() { flush_say; printf '  %swarn%s %s\n' "$C_YLW" "$C_OFF" "$*"; WARNINGS=$((WARNINGS + 1)); }
+fail() { flush_say; printf '  %sFAIL%s %s\n' "$C_RED" "$C_OFF" "$*"; FAILURES=$((FAILURES + 1)); }
+die()  { printf '%serror%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+WARNINGS=0 FAILURES=0
+
+need_root() { [[ $(id -u) == 0 ]] || die "run as root: sudo ${0##*/} ${BOX_ARGS:-}"; }
+need_env() { [[ -e $SRV_HOST_ENV ]] || die "missing $SRV_HOST_ENV (see examples/example.env, docs/host-setup.md)"; }
+get() { "$SRV" get "$@"; }
+confirm() {
+	local a
+	[[ ${SRV_YES:-0} == 1 ]] && return 0
+	[[ -t 0 ]] || return 1
+	read -r -p "$1 [y/N] " a
+	[[ $a == [yY]* ]]
+}
+
+# install_file SRC DEST [MODE]: copy if different, keep a .bak of the old file.
+# Returns 0 when the file changed.
+# Every file box installs is recorded in MANAGED_LIST (and its .bak copy is
+# box's too): box distdeb leaves them out of what differs from Debian.
+MANAGED_LIST=/var/lib/srv-host/managed-files
+managed_add() {
+	mkdir -p "$(dirname "$MANAGED_LIST")"
+	grep -qxF "$1" "$MANAGED_LIST" 2>/dev/null || printf '%s\n' "$1" >>"$MANAGED_LIST"
+}
+
+install_file() {
+	local src=$1 dest=$2 mode=${3:-0644}
+	managed_add "$dest"
+	if [[ -f $dest ]] && cmp -s "$src" "$dest"; then return 1; fi
+	mkdir -p "$(dirname "$dest")"
+	[[ -f $dest ]] && cp -a "$dest" "$dest.bak"
+	install -m "$mode" "$src" "$dest"
+	echo "  installed $dest"
+}
+
+# install_text DEST [MODE] < content
+install_text() {
+	local tmp rc=0
+	tmp=$(mktemp)
+	cat >"$tmp"
+	install_file "$tmp" "$@" || rc=$?
+	rm -f "$tmp"
+	return $rc
+}
+
+renews_certificates() {
+	local v
+	v=$(get ssl_renew "")
+	[[ $v == yes ]] && return 0
+	[[ $v == no ]] && return 1
+	[[ $(get is_leader no) == yes ]]   # default: the leader
+}
+
+# ---------------------------------------------------------------- generators
+# Each prints the exact content of one managed file.
+
+gen_apt_minimal() {
+	cat <<-'EOF'
+		// box: keep the package set minimal.
+		APT::Install-Recommends "false";
+		APT::Install-Suggests "false";
+	EOF
+}
+
+ssh_password_auth() {
+	local v
+	v=$(get ssh_password_auth "")
+	case $v in
+		"" | no) echo no ;;
+		yes) echo yes ;;
+		*) die "ssh_password_auth=$v: expected yes or no" ;;
+	esac
+}
+
+default_ssh_allow_users() {
+	local adm
+	adm=$(admin_role)
+	if [[ $adm == root ]]; then
+		echo root
+	else
+		echo "root $adm"
+	fi
+}
+
+gen_sshd_dropin() {
+	local p allow pw
+	allow=$(get ssh_allow_users "$(default_ssh_allow_users)") || return 1
+	pw=$(ssh_password_auth) || return 1
+	echo "# Generated by box ssh (host/ssh/srv.conf + host values)."
+	for p in $(ssh_ports); do echo "Port $p"; done
+	cat "$REPO/host/ssh/srv.conf"
+	echo "PasswordAuthentication $pw"
+	[[ -n $allow ]] && echo "AllowUsers $allow"
+	return 0
+}
+
+gen_fail2ban_ssh() {
+	cat <<-EOF
+		# Generated by box: sshd port(s) from the host env file.
+		[sshd]
+		port = $(ssh_ports | tr ' ' ',')
+	EOF
+}
+
+gen_cron() {
+	local services data
+	services=" $(get services) "
+	data=$(get data_dir /home/data)
+	# `box run NAME CMD`: output to the journal (journalctl -t srv-NAME),
+	# and an alert email when CMD fails.
+	echo "# Generated by box cron: edit box, not this file."
+	echo "SHELL=/bin/bash"
+	echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	echo "MAILTO=\"\""
+	echo
+	echo "# Package upgrades (daily)"
+	echo "0 1 * * * root box run upgrade box upgrade"
+	if [[ $services == *" db "* ]]; then
+		echo "# Consistent database dump (daily)"
+		echo "30 2 * * * root box run db-dump srv hook db dump"
+	fi
+	if [[ $services == *" agy "* ]]; then
+		echo "# Folders shared with the agents (overlays): mount them again after a reboot"
+		echo "@reboot root box run agy-shares srv hook agy share"
+	fi
+	if [[ $services == *" jellyfin "* ]]; then
+		echo "# Writable overlay over the downloads folder: mount it again after a reboot"
+		echo "@reboot root box run jellyfin-overlay srv hook jellyfin mount"
+	fi
+	if [[ $services == *" mail "* ]]; then
+		echo "# DMARC reports kept here: delete those older than 90 days (daily)"
+		echo "45 2 * * * root box run mail-reports srv hook mail prune-reports"
+	fi
+	if [[ -n $(get remote_hosts "") ]]; then
+		echo "# Replicate the data folder to the other hosts (daily)"
+		echo "0 3 * * * root box run data-push $REPO/backup/data-sync.sh push"
+	fi
+	echo "# Local incremental backup (daily)"
+	echo "0 4 * * * root box run backup $REPO/backup/diff-backup.sh $data $(get backup_dir /home/backup)"
+	if [[ -n $(get smtp "") && $services == *" dns "* ]]; then
+		echo "# smtp.blunderer.org in this host's BIND: only the mail hosts that work (every 5 minutes)"
+		echo "*/5 * * * * root box run smtp-health box smtp-health"
+	fi
+	if [[ $(get in_inventory yes) == yes && -n $(peers) ]]; then
+		echo "# The other hosts' services, from outside; alerts on a change (every 15 minutes)"
+		echo "*/15 * * * * root box run peer-health box peer-health"
+	fi
+	if renews_certificates; then
+		echo "# Let's Encrypt (daily; lego renews only when due)"
+		echo "0 5 * * * root box run ssl-renew $REPO/ssl/renew.sh"
+	fi
+	echo "# Pick up renewed certificates (daily, every host)"
+	echo "0 6 * * * root box run reload srv reload web mail"
+	echo "# Health: alert on failures (daily), full report (weekly, Monday)"
+	echo "0 7 * * * root box watch"
+	echo "30 7 * * 1 root box report"
+}
+
+# msmtp sends the alerts through the mail service, authenticated as a
+# dedicated account (docs/host-setup.md, "Email alerts").
+gen_msmtprc() {
+	local data
+	data=$(get data_dir /home/data)
+	cat <<-EOF
+		# Generated by box alerts.
+		defaults
+		auth on
+		tls on
+		tls_trust_file /etc/ssl/certs/ca-certificates.crt
+		syslog LOG_MAIL
+		aliases /etc/aliases.msmtp
+
+		account alerts
+		host $(get alert_smtp_host "$(get mail_relay)")
+		port $(get alert_smtp_port 587)
+		tls_starttls $([[ $(get alert_smtp_port 587) == 465 ]] && echo off || echo on)
+		from $(get alert_from "alerts@blunderer.org")
+		user $(get alert_smtp_user alerts)
+		passwordeval "cat $data/keys/alerts/smtp_password"
+
+		account default : alerts
+	EOF
+}
+
+gen_msmtp_aliases() {
+	cat <<-EOF
+		# Generated by box alerts: local mail (cron, root...) goes to alert_email.
+		default: $(get alert_email "")
+	EOF
+}
+
+alerts_configured() { [[ -n $(get alert_email "") ]]; }
+
+gen_hostname() { get host; }
+
+# /etc/hosts: localhost, then every host of the inventory, so the hosts
+# reach each other by name even when DNS is down (e.g. during a takeover).
+gen_hosts() {
+	local domain h ip6
+	domain=$(get domain blunderer.org)
+	cat <<-EOF
+		# Generated by box hostname from the inventory (hosts.env).
+		# Local additions are lost on the next run: put them in the inventory.
+		127.0.0.1	localhost
+		::1		localhost ip6-localhost ip6-loopback
+		ff02::1		ip6-allnodes
+		ff02::2		ip6-allrouters
+
+	EOF
+	for h in $(get hosts); do
+		printf '%s\t%s.%s %s\n' "$(get "${h}_ip")" "$h" "$domain" "$h"
+		ip6=$(get "${h}_ip6" "")
+		[[ -z $ip6 ]] || printf '%s\t%s.%s %s\n' "$ip6" "$h" "$domain" "$h"
+	done
+}
+
+# ------------------------------------------------------------------ hostname
+
+
+gen_cloud_cfg() {
+	cat <<-'EOF'
+		# Generated by box hostname: keep cloud-init from resetting the
+		# hostname and /etc/hosts at boot.
+		preserve_hostname: true
+		manage_etc_hosts: false
+	EOF
+}
+
+# ------------------------------------------------------------------ resolver
+
+# systemd-resolved listens on 127.0.0.53/.54:53, which keeps Docker from
+# publishing port 53 for the dns service. Turning only its stub listener off
+# did not survive every reboot, so box resolver stops, disables and masks it,
+# and writes a plain /etc/resolv.conf: host_resolvers from the host config,
+# else the upstream servers resolved was using, else public ones.
+# shellcheck disable=SC2034 # used by cmd/box/resolver.sh
+RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/srv.conf
+RESOLV_UPSTREAM=/run/systemd/resolve/resolv.conf
+RESOLV_HEADER="# Generated by box resolver (host_resolvers): systemd-resolved is masked."
+
+resolved_active() { systemctl is-active -q systemd-resolved 2>/dev/null; }
+resolved_installed() { systemctl cat systemd-resolved >/dev/null 2>&1; }
+resolved_masked() { [[ $(systemctl is-enabled systemd-resolved 2>/dev/null) == masked ]]; }
+
+# The servers the host resolves through: never a loopback address (the dns
+# service is authoritative only, and the resolved stub is gone).
+host_resolvers() {
+	local list f
+	list=$(get host_resolvers "")
+	if [[ -z $list ]]; then
+		for f in "$RESOLV_UPSTREAM" /etc/resolv.conf; do
+			[[ -r $f ]] || continue
+			list=$(awk '$1 == "nameserver" && $2 !~ /^(127\.|::1$)/ {print $2}' "$f" | head -n 3 | xargs)
+			[[ -z $list ]] || break
+		done
+	fi
+	echo "${list:-1.1.1.1 9.9.9.9}"
+}
+
+gen_resolv_conf() {
+	local ns
+	echo "$RESOLV_HEADER"
+	for ns in $1; do echo "nameserver $ns"; done
+	echo "options edns0 timeout:2 attempts:2"
+}
+
+# /etc/resolv.conf is box's own file (not a link to resolved's).
+resolv_managed() {
+	[[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] && head -n 1 /etc/resolv.conf | grep -qxF "$RESOLV_HEADER"
+}
+
+# check_mail_names: for this host's IPv4 and (if in the inventory) IPv6
+# address, the reverse name is the mail name (server_name) and the mail name
+# resolves back to the address. The reverse is set at the hosting provider.
+check_mail_names() {
+	local name ip rev fwd
+	name=$(get server_name)
+	for ip in "$(get host_ip)" "$(get "$(get host)_ip6" "")"; do
+		[[ -n $ip ]] || continue
+		# getent exits 2 when nothing is found: not an error here.
+		rev=$({ getent hosts "$ip" 2>/dev/null || true; } | awk 'NR == 1 {print $2}')
+		fwd=$({ getent ahosts "$name" 2>/dev/null || true; } | awk '{print $1}' | sort -u | xargs)
+		if [[ ${rev%.} != "$name" ]]; then
+			warn "reverse of $ip is ${rev:-missing}, expected $name (set it at the hosting provider)"
+		elif [[ " $fwd " != *" $ip "* ]]; then
+			warn "$name does not resolve to $ip (it gives: ${fwd:-nothing}); deploy dns on the leader"
+		else
+			ok "$ip <-> $name"
+		fi
+	done
+	if [[ -z $(get "$(get host)_ip6" "") ]]; then
+		ok "no IPv6 in the inventory for this host: mail goes out over IPv4"
+	fi
+}
+
+# port_53_users: listeners on port 53 other than our containers' own forwarders.
+port_53_users() {
+	{ ss -Htulpn '( sport = :53 )' 2>/dev/null || true; } |
+		{ grep -vE '"(docker-proxy|pasta(\.[^"]*)?|rootlessport)"' || true; } |
+		awk '{print $1 " " $5 " " $7}'
+}
+
+# ---------------------------------------------------------------------- ipv6
+#
+# The inventory's <host>_ip6 is published in DNS (AAAA, glue) and used for
+# outgoing mail, so the host must really have it. Providers that route a /64
+# without router advertisements (OVH dedicated servers) need it configured by
+# hand: with ip6_gw in the host file, box ipv6 installs a systemd unit that
+# sets the address and the default route at boot (ip ... replace: harmless
+# next to the same settings from the system's own network configuration).
+# Without ip6_gw, the address is expected from the provider (cloud-init,
+# router advertisements); box check verifies it either way.
+
+IPV6_UNIT=/etc/systemd/system/srv-ipv6.service
+
+# ip6_intf: ip6_intf in the host file, else the interface of the IPv4 default
+# route.
+ip6_intf() {
+	local i
+	i=$(get ip6_intf "")
+	[[ -n $i ]] || i=$(ip -4 route show default 2>/dev/null | awk '{for (n = 1; n < NF; n++) if ($n == "dev") {print $(n + 1); exit}}')
+	echo "$i"
+}
+
+gen_ipv6_unit() {
+	local addr intf gw prefix
+	addr=$(get "$(get host)_ip6" "")
+	gw=$(get ip6_gw "")
+	intf=$(ip6_intf)
+	prefix=$(get ip6_prefix 64)
+	cat <<-EOF
+		# Generated by box ipv6: $(get host)_ip6 (inventory), ip6_gw and ip6_intf (host file).
+		[Unit]
+		Description=IPv6 address and default route from the srv host files (box ipv6)
+		After=network-online.target
+		Wants=network-online.target
+
+		[Service]
+		Type=oneshot
+		RemainAfterExit=yes
+		ExecStart=/usr/sbin/ip -6 addr replace $addr/$prefix dev $intf
+	EOF
+	# A gateway outside the prefix (OVH: ...ff:ff:ff:ff:ff) is reached directly
+	# on the link; a link-local one (fe80::1) is on the link already.
+	[[ $gw == fe80:* ]] || echo "ExecStart=/usr/sbin/ip -6 route replace $gw dev $intf"
+	cat <<-EOF
+		ExecStart=/usr/sbin/ip -6 route replace default via $gw dev $intf
+		ExecStop=-/usr/sbin/ip -6 route del default via $gw dev $intf
+
+		[Install]
+		WantedBy=multi-user.target
+	EOF
+}
+
+
+# check_ipv6: the inventory's address is on an interface, there is an IPv6
+# default route, and the internet answers over IPv6.
+check_ipv6() {
+	local addr
+	addr=$(get "$(get host)_ip6" "")
+	[[ -n $addr ]] || return 0
+	if ! ip -6 addr show scope global | grep -qiw "inet6 $addr"; then
+		fail "$addr ($(get host)_ip6) is not on any interface: AAAA records and mail point to it (set ip6_gw, then box ipv6)"
+		return 0
+	fi
+	if [[ -z $(ip -6 route show default) ]]; then
+		fail "$addr is configured, but there is no IPv6 default route (set ip6_gw, then box ipv6)"
+	elif ping -6 -c 1 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 || ping -6 -c 1 -W 3 2620:fe::fe >/dev/null 2>&1; then
+		ok "IPv6 $addr: configured, and the internet answers"
+	else
+		fail "IPv6 $addr is configured, but nothing answers over it (gateway ip6_gw=$(get ip6_gw "") right?)"
+	fi
+}
+
+# --------------------------------------------------------------------- shell
+#
+# The same shell everywhere: ~/.bashrc and ~/.profile from host/shell/ for
+# root and the admin account (unix_role), on every host. Per-host or personal
+# additions go in ~/.bashrc.local and ~/.profile.local, which box leaves alone.
+
+SHELL_FILES=(bashrc profile)
+
+# shell_users: "user home" for root and admin_role.
+shell_users() {
+	local u
+	for u in root "$(admin_role)"; do
+		[[ -n $u ]] || continue
+		getent passwd "$u" | awk -F: '{print $1, $6}'
+	done | sort -u
+}
+
+
+# check_shell_user USER HOME: the files are box's, and nothing makes bash skip
+# ~/.profile (it reads ~/.bash_profile or ~/.bash_login instead, if present).
+check_shell_user() {
+	local u=$1 home=$2 f bad=()
+	for f in "${SHELL_FILES[@]}"; do
+		cmp -s "$REPO/host/shell/$f" "$home/.$f" || bad+=(".$f")
+	done
+	if ((${#bad[@]})); then
+		warn "$u: ${bad[*]} differ from host/shell (box shell; own additions go in ~/.bashrc.local)"
+	else
+		ok "$u: ~/.bashrc and ~/.profile are box's"
+	fi
+	for f in .bash_profile .bash_login; do
+		[[ -e $home/$f ]] && warn "$u: $home/$f exists, so bash ignores ~/.profile at login (move its content to ~/.profile.local, then delete it)"
+	done
+	return 0
+}
+
+# ----------------------------------------------------------------------- man
+#
+# The manual pages of what runs in the containers (postconf(5), named.conf(5),
+# nginx(8)...), readable on the host with man. The images are slim and have
+# none, so box man takes them from Debian's packages of the same programs:
+# MANPAGES in each enabled service's service.env names them. The packages are
+# downloaded and only their pages extracted, into /usr/local/share/man; none
+# is installed. Debian's versions may differ a little from the images'.
+
+# shellcheck disable=SC2034 # used by cmd/box/man.sh
+MAN_DIR=/usr/local/share/man
+MAN_STATE=/var/lib/srv-host/manpages
+
+# man_wanted: the packages named by MANPAGES of this host's services, sorted.
+man_wanted() {
+	local svc f
+	for svc in $(get services); do
+		f=$REPO/services/$svc/service.env
+		[[ -f $f ]] || continue
+		sed -n 's/^MANPAGES="\(.*\)"$/\1/p' "$f"
+	done | tr ' ' '\n' | sed '/^$/d' | sort -u
+}
+
+
+# check_man: the pages installed are those of this host's services.
+check_man() {
+	local want
+	want=$(man_wanted)
+	[[ -n $want ]] || return 0
+	if [[ $want == "$(cat "$MAN_STATE" 2>/dev/null)" ]]; then
+		ok "man pages of the services' programs installed ($(wc -l <"$MAN_STATE.files" 2>/dev/null || echo 0) pages)"
+	else
+		warn "the man pages do not match this host's services: box man"
+	fi
+}
+
+
+# ------------------------------------------------------------------ packages
+
+
+# box link: srv and box on the PATH (sudo keeps /usr/local/bin), so neither
+# needs its full path. First step of setup: nothing it needs can fail.
+# shellcheck disable=SC2034 # used by cmd/box/{link,unlink}.sh
+LINKS=(srv box remote)
+
+# The data folder before the host env exists: DATA_DIR given to link/unlink,
+# else the one the current host env names, else /home/data.
+link_data_dir() {
+	if [[ -n ${1:-} ]]; then
+		echo "${1%/}"
+	elif [[ -e $SRV_HOST_ENV ]]; then
+		get data_dir /home/data
+	else
+		echo /home/data
+	fi
+}
+
+
+# unlink_if_into LINK DIR: remove LINK if it is a symlink to a file in DIR.
+unlink_if_into() {
+	local link=$1 dir=$2 target
+	target=$(readlink -f "$link" 2>/dev/null || true)
+	if [[ ! -L $link ]]; then
+		if [[ -e $link ]]; then warn "$link is a file, not a link: left alone"; else ok "no $link"; fi
+	elif [[ $target == "$dir"/* ]]; then
+		rm -f "$link"
+		ok "removed $link"
+	else
+		warn "$link points to $target, not into $dir: left alone"
+	fi
+}
+
+# -------------------------------------------------------------------- podman
+
+gen_podman_sysctl() {
+	cat <<-'EOF'
+	# Generated by box podman: edit box, not this file.
+	# Allow rootless Quadlet containers to publish ports >= 25 (smtp, dns, http, https).
+	net.ipv4.ip_unprivileged_port_start = 25
+	net.ipv4.ping_group_range = 0 2147483647
+	fs.inotify.max_user_instances = 512
+	EOF
+}
+
+gen_podman_modules() {
+	cat <<-'EOF'
+	# Generated by box podman: edit box, not this file.
+	tun
+	EOF
+}
+
+gen_podman_containers_conf() {
+	cat <<-'EOF'
+	# Generated by box podman: edit box, not this file.
+	[containers]
+	log_driver = "journald"
+
+	[engine]
+	runtime = "crun"
+	EOF
+}
+
+gen_podman_storage_conf() {
+	local storage
+	storage=$(get podman_storage_dir /home/podman)
+	cat <<-EOF
+	# Generated by box podman: edit box, not this file.
+	[storage]
+	driver = "overlay"
+	graphroot = "$storage"
+	EOF
+}
+
+_subid_ok() { rt_subid_ok "$@"; }
+
+
+# ----------------------------------------------------------------------- ssh
+
+SSH_CONFIRMED=/etc/ssh/srv-port-confirmed
+
+# ssh_ports: ports sshd should listen on. While moving off 22, both stay open
+# until `box ssh-confirm` (so a mistake cannot lock you out).
+ssh_ports() {
+	local port
+	port=$(get ssh_port 222)
+	if [[ $port != 22 && $(cat "$SSH_CONFIRMED" 2>/dev/null) != "$port" ]]; then
+		echo "22 $port"
+	else
+		echo "$port"
+	fi
+}
+
+
+# ------------------------------------------------------------------ ssh-keys
+#
+# One key pair per host, for the hosts to reach each other (replication,
+# certificates, inventory, takeover): <data>/keys/ssh/id_ecdsa_<host>(.pub).
+# They live in the data folder, created on the leader for every host of the
+# inventory and replicated from there (a key created elsewhere would be
+# deleted by the next replication). Each host installs its own pair in the
+# ~/.ssh of root (cron jobs) and of unix_role, and authorizes the
+# others' public keys for unix_role. Root never logs in over ssh.
+
+ssh_dir() { echo "$(get data_dir /home/data)/keys/ssh"; }
+host_key() { echo "$(ssh_dir)/id_ecdsa_$1"; } # host_key HOST: root-only sync key (or client key off-inventory)
+
+SRV_SYNC_ENDPOINT=/usr/local/libexec/srv-sync-endpoint
+SRV_SYNC_CONF=/etc/srv/sync-endpoint.conf
+SUDO_AUTH_KEYS=/etc/ssh/sudo_authorized_keys
+gen_sync_endpoint_conf() { printf 'DATA_DIR=%s\n' "$(get data_dir /home/data)"; }
+
+# ssh port of host H: <H>_ssh_port (inventory, or ssh_port in configs/<H>.env), else this host's ssh_port.
+peer_ssh_port() { get "$1_ssh_port" "$(get ssh_port 222)"; }
+
+# The other hosts of the inventory.
+peers() {
+	local h self
+	self=$(get host)
+	for h in $(get hosts); do
+		[[ $h == "$self" ]] || echo "$h"
+	done
+}
+
+# Accounts that get this host's key in their ~/.ssh:
+# - On inventory servers: root ONLY (used exclusively for forced-command rsync;
+#   admin_role uses ssh -A or `box loadssh` with a personal/laptop key).
+# - Outside the inventory (a laptop): root, admin_role, and SUDO_USER.
+key_accounts() {
+	local user
+	user=$(admin_role)
+	echo root
+	if [[ $(get in_inventory yes) == no ]]; then
+		if [[ $user != root ]] && getent passwd "$user" >/dev/null; then echo "$user"; fi
+		if [[ -n ${SUDO_USER:-} && $SUDO_USER != root && $SUDO_USER != "$user" ]]; then
+			echo "$SUDO_USER"
+		fi
+	fi
+}
+
+account_home() { getent passwd "$1" | cut -d: -f6; }
+
+gen_ssh_client() {
+	local h ip ip6 dom self user has_key=no in_inv patterns=() pat
+	self=$(get host) user=$(admin_role) dom=$(get domain blunderer.org)
+	in_inv=$(get in_inventory yes)
+	[[ -s $(host_key "$self") ]] && has_key=yes
+	echo "# Generated by box ssh-keys: how this host reaches the others."
+	if [[ $in_inv == yes ]]; then
+		for h in $(peers); do
+			ip=$(get "${h}_ip")
+			ip6=$(get "${h}_ip6" "")
+			patterns+=("$h" "$h.$dom" "$ip")
+			[[ -n $ip6 ]] && patterns+=("$ip6")
+		done
+		if ((${#patterns[@]} > 0)); then
+			pat=$(IFS=,; echo "${patterns[*]}")
+			echo
+			echo "Match localuser root host $pat"
+			echo "	User root"
+			if [[ $has_key == yes ]]; then
+				echo "	IdentityFile /root/.ssh/id_ecdsa_$self"
+				echo "	IdentitiesOnly yes"
+			fi
+		fi
+	fi
+	for h in $(peers); do
+		ip6=$(get "${h}_ip6" "")
+		echo
+		echo "Host $h $h.$dom $(get "${h}_ip")${ip6:+ $ip6}"
+		echo "	Port $(peer_ssh_port "$h")"
+		echo "	User $user"
+		if [[ $in_inv == no ]]; then
+			# On a laptop, forward ssh-agent so pam_ssh_agent_auth & peer jumps work without -A.
+			echo "	ForwardAgent yes"
+			if [[ $has_key == yes ]]; then
+				# Laptop client key, installed in ~/.ssh.
+				echo "	IdentityFile ~/.ssh/id_ecdsa_$self"
+				echo "	IdentitiesOnly yes"
+			fi
+		fi
+		echo "	ConnectTimeout 10"
+		# First connection records the host key; a changed key is refused.
+		echo "	StrictHostKeyChecking accept-new"
+	done
+}
+
+# valid_ssh_pubkey FILE: 0 if FILE contains a single valid OpenSSH public key
+# line with no leading authorized_keys options or control characters.
+valid_ssh_pubkey() {
+	local f=$1 line count=0
+	[[ -s $f ]] || return 1
+	while IFS= read -r line || [[ -n $line ]]; do
+		[[ -z $line ]] && continue
+		count=$((count + 1))
+		((count == 1)) || return 1
+		[[ $line =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-[^[:space:]]+)[[:space:]][A-Za-z0-9+/=]+([[:space:]][^[:cntrl:]]*)?$ ]] || return 1
+	done <"$f"
+	((count == 1)) || return 1
+	ssh-keygen -l -f "$f" >/dev/null 2>&1
+}
+
+# The managed block of admin_role's authorized_keys: ONLY personal ssh_clients
+# (laptop, phone...). Server host keys are never authorized for admin_role so
+# servers cannot move laterally without an explicitly forwarded/loaded client key.
+SSH_BEGIN='# >>> box ssh-keys: the other hosts (managed, edit outside this block)'
+SSH_END='# <<< box ssh-keys'
+gen_authorized_block() {
+	local pub c line
+	echo "$SSH_BEGIN"
+	for c in $(get ssh_clients ""); do
+		pub=$(client_key "$c")
+		if valid_ssh_pubkey "$pub"; then
+			while IFS= read -r line || [[ -n $line ]]; do
+				[[ -n $line ]] && printf '%s\n' "$line"
+			done <"$pub"
+		fi
+	done
+	echo "$SSH_END"
+}
+
+# /etc/ssh/sudo_authorized_keys (root-owned, for pam_ssh_agent_auth): ONLY
+# personal ssh_clients public keys, never server host keys.
+gen_sudo_authorized_keys() {
+	local pub c line
+	echo "# Generated by box ssh-keys: SSH client keys allowed to authenticate sudo."
+	for c in $(get ssh_clients ""); do
+		pub=$(client_key "$c")
+		if valid_ssh_pubkey "$pub"; then
+			while IFS= read -r line || [[ -n $line ]]; do
+				[[ -n $line ]] && printf '%s\n' "$line"
+			done <"$pub"
+		fi
+	done
+}
+
+# /root/.ssh/authorized_keys is exclusively managed by box ssh-keys: peer hosts'
+# keys, locked to srv-sync-endpoint so a peer key can never open a root shell.
+gen_root_authorized_keys() {
+	local h pub line
+	echo "$SSH_BEGIN"
+	for h in $(peers); do
+		pub=$(host_key "$h").pub
+		if valid_ssh_pubkey "$pub"; then
+			while IFS= read -r line || [[ -n $line ]]; do
+				[[ -n $line ]] && printf 'restrict,command="%s" %s\n' "$SRV_SYNC_ENDPOINT" "$line"
+			done <"$pub"
+		fi
+	done
+	echo "$SSH_END"
+}
+
+# A client that is a machine of ours with box (a laptop, host=<name> in its
+# host file) may instead have a pair made by box on the leader, like a host's:
+# <data>/keys/ssh/id_ecdsa_<name>; box ssh-keys there installs it.
+client_key() {
+       if [[ -s $(ssh_dir)/clients/$1.pub ]]; then
+               echo "$(ssh_dir)/clients/$1.pub"
+       elif [[ -s $(host_key "$1").pub ]]; then
+               echo "$(host_key "$1").pub"
+       else
+               echo "$(ssh_dir)/clients/$1.pub"
+       fi
+}
+
+# check_ssh_clients: each one has a valid public key, authorized here.
+check_ssh_clients() {
+	local c pub auth
+	auth=$(authorized_keys_file)
+	for c in $(get ssh_clients ""); do
+		pub=$(client_key "$c")
+		if [[ ! -s $pub ]]; then
+			fail "ssh client $c has no key: $pub (one line, from ~/.ssh/*.pub on that machine)"
+		elif ! ssh-keygen -l -f "$pub" >/dev/null 2>&1; then
+			fail "$pub is not a valid public key"
+		elif grep -qF "$(awk '{print $2}' "$pub")" "$auth" 2>/dev/null; then
+			ok "client $c may log in as $(admin_role)"
+		else
+			fail "client $c's key is not in $auth: box ssh-keys"
+		fi
+	done
+	return 0
+}
+
+# gen_authorized_keys FILE: FILE with the managed block replaced (or added
+# at the end). The other keys (yours) are kept.
+gen_authorized_keys() {
+	local file=$1
+	if [[ -f $file ]]; then
+		awk -v b="$SSH_BEGIN" -v e="$SSH_END" '
+			$0 == b {skip = 1; next}
+			$0 == e {skip = 0; next}
+			!skip' "$file"
+	fi
+	gen_authorized_block
+}
+
+authorized_keys_file() { echo "$(account_home "$(admin_role)")/.ssh/authorized_keys"; }
+
+
+# Directories inside <data> that hold secrets or database dumps and must be
+# strictly root:root (0700 dirs, 0600 files), unreachable by unix_role.
+# (keys/tor stays UID 1000 because srv-onion bind-mounts it directly.)
+PROTECTED_SECRET_DIRS=(
+	keys/ssh keys/acme keys/ssl keys/opendkim keys/postsrsd
+	keys/dns keys/websso keys/mariadb keys/alerts backups
+)
+
+protect_data_secrets() {
+	local data backup rel p
+	data=$(get data_dir /home/data)
+	backup=$(get backup_dir /home/backup)
+	for rel in "${PROTECTED_SECRET_DIRS[@]}"; do
+		p="$data/$rel"
+		[[ -d $p ]] || continue
+		chown -R 0:0 "$p"
+		find "$p" -type d -exec chmod 0700 {} +
+		find "$p" -type f -exec chmod 0600 {} +
+	done
+	if [[ -d $backup ]]; then
+		# Top-level only: blocks unix_role traversal while preserving original
+		# file ownership inside snapshots (needed for rsync --link-dest between backups).
+		chown 0:0 "$backup"
+		chmod 0700 "$backup"
+	fi
+}
+
+# check_unix_role: the account named by unix_role exists with uid 1000, and
+# when separated from admin_role has no sudo privileges and no SSH key access.
+check_unix_role() {
+	local role adm uid home allow
+	role=$(unix_role)
+	adm=$(admin_role)
+	if ! uid=$(id -u "$role" 2>/dev/null); then
+		fail "no account $role (unix_role): useradd -m -u 1000 $role"
+		return 0
+	elif [[ $uid != 1000 ]]; then
+		fail "$role (unix_role) has uid $uid, not 1000: the services' files and containers use 1000 ($(getent passwd 1000 | cut -d: -f1 || echo nobody) has it)"
+	else
+		ok "$role (unix_role) has uid 1000"
+	fi
+
+	if [[ $role == "$adm" ]]; then
+		warn "unix_role ($role) and admin_role ($adm) are the same account: set unix_role/admin_role and run box apply-role-change"
+		if sudo -l -U "$adm" 2>/dev/null | grep -q 'NOPASSWD:'; then
+			warn "$adm (admin_role) has NOPASSWD sudo rules (check /etc/sudoers.d/*)"
+		fi
+		return 0
+	fi
+
+	# Verify unix_role has a non-login shell (/usr/sbin/nologin or /bin/false).
+	local rshell
+	rshell=$(getent passwd "$role" | cut -d: -f7)
+	case $rshell in
+		/usr/sbin/nologin | /sbin/nologin | /bin/false | /usr/bin/false)
+			ok "$role (unix_role) shell is $rshell"
+			;;
+		*)
+			fail "$role (unix_role) has login shell '$rshell': usermod -s /usr/sbin/nologin $role"
+			;;
+	esac
+
+	# Verify unix_role has no sudo privileges.
+	if id -nG "$role" 2>/dev/null | grep -qwE 'sudo|wheel'; then
+		fail "$role (unix_role) is in the sudo/wheel group: gpasswd -d $role sudo"
+	elif sudo -l -U "$role" 2>/dev/null | grep -q 'may run the following commands'; then
+		fail "$role (unix_role) has sudoers privileges (check /etc/sudoers and /etc/sudoers.d)"
+	else
+		ok "$role (unix_role) has no sudo privileges"
+	fi
+
+	# Warn if admin_role still has passwordless sudo (e.g. cloud-init drop-in).
+	if id "$adm" >/dev/null 2>&1; then
+		if sudo -l -U "$adm" 2>/dev/null | grep -q 'NOPASSWD:'; then
+			warn "$adm (admin_role) has NOPASSWD sudo rules (check /etc/sudoers.d/*)"
+		else
+			ok "$adm (admin_role) sudo requires a password"
+		fi
+	fi
+
+	# Verify unix_role has no SSH keys or SSH login access.
+	home=$(account_home "$role")
+	if [[ -n $home && ( -e $home/.ssh/authorized_keys || -n $(compgen -G "$home/.ssh/id_*" 2>/dev/null || true) ) ]]; then
+		fail "$role (unix_role) has SSH keys in $home/.ssh: rm -rf $home/.ssh"
+	else
+		ok "$role (unix_role) has no SSH keys"
+	fi
+	allow=$(sshd -T 2>/dev/null | awk '$1 == "allowusers" { $1=""; print $0 }')
+	if [[ -n $allow && " $allow " == *" $role "* ]]; then
+		fail "$role (unix_role) is in sshd AllowUsers: box ssh"
+	fi
+	return 0
+}
+
+check_ssh_peers() {
+	local self key h a ahome out level=warn auth rauth
+	self=$(get host) key=$(host_key "$(get host)")
+	[[ $(get is_leader no) == yes ]] && level=fail
+
+	case $(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}') in
+		forced-commands-only) ok "sshd root login restricted to forced-commands-only" ;;
+		"") warn "cannot read sshd's settings (sshd -T)" ;;
+		*) fail "sshd PermitRootLogin should be forced-commands-only (for restricted root peer sync): box ssh" ;;
+	esac
+	if [[ $(get in_inventory yes) == yes ]]; then
+		if [[ -x $SRV_SYNC_ENDPOINT && $(stat -c '%u:%g %a' "$SRV_SYNC_ENDPOINT" 2>/dev/null) == "0:0 755" ]] &&
+			cmp -s "$REPO/host/ssh/srv-sync-endpoint" "$SRV_SYNC_ENDPOINT"; then
+			ok "$SRV_SYNC_ENDPOINT installed"
+		else
+			fail "$SRV_SYNC_ENDPOINT missing, outdated, or wrong mode/owner: box ssh-keys"
+		fi
+		if [[ -f $SRV_SYNC_CONF && $(stat -c '%u:%g %a' "$SRV_SYNC_CONF" 2>/dev/null) == "0:0 600" ]] &&
+			! differs "$SRV_SYNC_CONF" gen_sync_endpoint_conf; then
+			ok "$SRV_SYNC_CONF matches data_dir"
+		else
+			fail "$SRV_SYNC_CONF missing, outdated, or wrong mode/owner: box ssh-keys"
+		fi
+	fi
+	local want_pw
+	want_pw=$(ssh_password_auth) || return 1
+	case $(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}') in
+		"$want_pw") ok "sshd PasswordAuthentication is $want_pw" ;;
+		"") ;;
+		*) fail "sshd PasswordAuthentication is not $want_pw: box ssh" ;;
+	esac
+
+	if [[ ! -s $key || ! -s $key.pub ]]; then
+		fail "no ssh key pair $key(.pub): box ssh-keys on the leader"
+		return 0
+	fi
+	[[ $(stat -c %a "$key") == 600 ]] || fail "$key is readable by others: chmod 600"
+	if [[ $(ssh-keygen -y -f "$key" 2>/dev/null | awk '{print $2}') != "$(awk '{print $2}' "$key.pub")" ]]; then
+		fail "$key.pub does not belong to $key"
+		return 0
+	fi
+	for a in $(key_accounts); do
+		ahome=$(account_home "$a")
+		if cmp -s "$key" "$ahome/.ssh/id_ecdsa_$self"; then
+			ok "key installed for $a"
+		else
+			fail "$ahome/.ssh/id_ecdsa_$self missing or different from $key: box ssh-keys"
+		fi
+	done
+
+	# Off the inventory (a laptop) nobody logs in here: no keys to authorize.
+	if [[ $(get in_inventory yes) == yes ]]; then
+		local adm_home
+		adm_home=$(account_home "$(admin_role)")
+		if [[ -n $adm_home && -e $adm_home/.ssh/id_ecdsa_$self ]]; then
+			fail "$adm_home/.ssh/id_ecdsa_$self should not be in $(admin_role)'s ~/.ssh (server key is root-sync only): box ssh-keys"
+		fi
+		auth=$(authorized_keys_file)
+		rauth="/root/.ssh/authorized_keys"
+		if [[ -f $rauth ]]; then
+			local rline bad_root=0
+			while IFS= read -r rline || [[ -n $rline ]]; do
+				[[ -z $rline || $rline == \#* ]] && continue
+				if [[ $rline != "restrict,command=\"$SRV_SYNC_ENDPOINT\" "* ]]; then
+					bad_root=1
+					break
+				fi
+			done <"$rauth"
+			if ((bad_root)); then
+				fail "$rauth contains an unrestricted key (expected restrict,command=\"$SRV_SYNC_ENDPOINT\"): box ssh-keys"
+			else
+				ok "$rauth keys restricted to $SRV_SYNC_ENDPOINT"
+			fi
+		fi
+		for h in $(peers); do
+			if [[ ! -s $(host_key "$h").pub ]]; then
+				fail "no public key for $h in $(ssh_dir): box ssh-keys on the leader"
+			else
+				local pubkey
+				pubkey=$(awk '{print $2}' "$(host_key "$h").pub")
+				if grep -qF "restrict,command=\"$SRV_SYNC_ENDPOINT\" " "$rauth" 2>/dev/null && grep -qF "$pubkey" "$rauth" 2>/dev/null; then
+					ok "$h may sync as root (forced-command)"
+				else
+					fail "$h's key is not in $rauth: box ssh-keys"
+				fi
+				if grep -qF "$pubkey" "$auth" 2>/dev/null; then
+					fail "$h's server key is in $auth (server keys must not allow lateral admin login): box ssh-keys"
+				fi
+			fi
+		done
+	fi
+
+	[[ -s /etc/ssh/ssh_config.d/srv.conf ]] || fail "no ssh client settings for the other hosts: box ssh-keys"
+	for h in $(peers); do
+		if out=$(ssh -F /etc/ssh/ssh_config -o BatchMode=yes "$h" true 2>&1); then
+			ok "ssh to $h"
+		else
+			"$level" "ssh to $h ($(get "${h}_ip"), port $(peer_ssh_port "$h")) fails: $(tail -n 1 <<<"$out")"
+		fi
+	done
+	return 0
+}
+
+# ------------------------------------------------------------------ fail2ban
+
+write_fail2ban_ssh() {
+	gen_fail2ban_ssh | install_text /etc/fail2ban/jail.d/srv-sshd.local
+}
+
+# ------------------------------------------------------------- ssh-trusted
+
+# Addresses fail2ban never bans (this host's own state, not in git: your home
+# and office addresses). box fail2ban leaves this file alone.
+TRUSTED_FILE=/etc/fail2ban/jail.d/srv-trusted.local
+
+# client_ip: the address of the ssh session running this command, or nothing.
+# sudo drops SSH_CONNECTION; `who -m` reads it from the terminal's login entry.
+client_ip() {
+	local ip=${SSH_CONNECTION:-}
+	ip=${ip%% *}
+	if [[ -z $ip ]]; then
+		ip=$(who -m 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p' | head -n 1)
+	fi
+	if valid_ip "$ip"; then echo "$ip"; fi
+}
+
+# valid_ip ADDR: an IPv4/IPv6 address or network (CIDR).
+valid_ip() {
+	[[ -n ${1:-} ]] && python3 -c 'import ipaddress, sys; ipaddress.ip_network(sys.argv[1], strict=False)' "$1" 2>/dev/null
+}
+
+# The hosts of the inventory, never banned either: they log in to each other
+# (replication) and box smtp-health logs in to every mail host every 5
+# minutes from every name server, so a wrong password there must not ban one.
+inventory_ips() {
+	local h
+	for h in $(get hosts ""); do
+		get "${h}_ip" ""
+		get "${h}_ip6" ""
+	done | sed '/^$/d' | sort -u
+}
+
+# Your trusted addresses: the ignoreip list minus loopback and the inventory.
+trusted_ips() {
+	[[ -f $TRUSTED_FILE ]] || return 0
+	sed -n 's/^ignoreip[[:space:]]*=[[:space:]]*//p' "$TRUSTED_FILE" | tr ' ' '\n' |
+		grep -vxE '127\.0\.0\.1/8|::1|' | grep -vxF -f <(inventory_ips; echo 127.0.0.1/8) || true
+}
+
+write_trusted() { # write_trusted ADDR...
+	mkdir -p "$(dirname "$TRUSTED_FILE")"
+	{
+		echo "# Managed by box: addresses fail2ban never bans (the inventory's"
+		echo "# hosts, and yours from box ssh-trusted)."
+		echo "[DEFAULT]"
+		echo "ignoreip = 127.0.0.1/8 ::1 $(inventory_ips | xargs)${*:+ $*}"
+	} >"$TRUSTED_FILE"
+	if systemctl is-active -q fail2ban 2>/dev/null; then
+		fail2ban-client reload >/dev/null
+	fi
+}
+
+
+# ---------------------------------------------------------------------- cron
+
+
+# --------------------------------------------------------------------- alerts
+
+
+# send_alert SUBJECT < body: one email to alert_email; never fails the caller.
+send_alert() {
+	local subject=$1 host
+	host=$(hostname -s)
+	if ! alerts_configured; then
+		echo "alert (not sent, alert_email unset): $subject" >&2
+		cat >/dev/null
+		return 0
+	fi
+	{
+		echo "To: $(get alert_email)"
+		echo "From: box $host <$(get alert_from "alerts@blunderer.org")>"
+		echo "Subject: [$host] $subject"
+		echo "Date: $(date -R)"
+		echo "Content-Type: text/plain; charset=UTF-8"
+		echo
+		# strip colours from captured output
+		sed -E 's/\x1b\[[0-9;]*m//g'
+		echo
+		echo "-- "
+		echo "box on $(get server_name) ($(hostname -f 2>/dev/null || hostname))"
+	} | /usr/bin/msmtp -t 2>&1 | systemd-cat -t srv-alert ||
+		echo "could not send the alert '$subject' (journalctl -t srv-alert)" >&2
+	return 0
+}
+
+
+# ------------------------------------------------------------------- upgrade
+
+
+# --------------------------------------------------------------------- check
+
+# old_volume_dirs: service volume folders still sitting in a previous SRV_VOLUMES root.
+old_volume_dirs() {
+	local cur_vols b v gd suf
+	cur_vols=$(realpath -m "$(get volumes_dir /home/volumes)")
+	local -a vols=() found=() vol_files=()
+	for f in "$REPO/services"/*/quadlet/* \
+		"${SRV_STATE:-/srv/releases}"/*/*/quadlet/*.container; do
+		[[ -f $f ]] && vol_files+=("$f")
+	done
+	if ((${#vol_files[@]} > 0)); then
+		mapfile -t vols < <(sed -n 's|.*[$]{SRV_VOLUMES}/\([^:/[:space:],]*\).*|\1|p' \
+			"${vol_files[@]}" 2>/dev/null | sort -u)
+	fi
+	while IFS= read -r b; do
+		[[ -n $b ]] || continue
+		b=$(realpath -m "$b")
+		[[ $b != "$cur_vols" && -d $b ]] || continue
+		for v in "${vols[@]}"; do
+			if [[ $v == *@instance@* ]]; then
+				while IFS= read -r gd; do
+					[[ -d $gd && " ${found[*]} " != *" $gd "* ]] && found+=("$gd")
+				done < <(compgen -G "$b/${v//@instance@/*}" || true)
+			elif [[ $v =~ ^@([a-z0-9]+)_vol@$ ]]; then
+				suf=${BASH_REMATCH[1]}
+				while IFS= read -r gd; do
+					[[ -d $gd && " ${found[*]} " != *" $gd "* ]] && found+=("$gd")
+				done < <(compgen -G "$b/agy-$suf" || true; compgen -G "$b/agy-*-$suf" || true)
+			elif [[ -d "$b/$v" && " ${found[*]} " != *" $b/$v "* ]]; then
+				found+=("$b/$v")
+			fi
+		done
+	done < <(
+		for f in "${SRV_STATE:-/srv/releases}"/*/*/.env; do
+			[[ -f $f ]] && sed -n 's/^SRV_VOLUMES=//p' "$f"
+		done | sort -u
+	)
+	local leg
+	for leg in "$(get jellyfin_overlay_dir /home/srv-jellyfin)" "$(get agy_share_dir /home/srv-agy)"; do
+		leg=$(realpath -m "$leg")
+		[[ $leg != "$cur_vols" && $leg != "$cur_vols"/* && -d $leg ]] || continue
+		[[ " ${found[*]} " != *" $leg "* ]] && found+=("$leg")
+	done
+	echo "${found[*]}"
+}
+
+
+# same_filesystem A B: can B hold hard links to files in A? Same device
+# number (a btrfs subvolume counts as a different one, which is right: hard
+# links cannot cross subvolumes either).
+same_filesystem() {
+	[[ $(stat -c %d "$1") == "$(stat -c %d "$2")" ]]
+}
+
+# check_path PATH [SERVICE]: directories end with /.
+check_path() {
+	local p=$1 svc=${2:+ ($2)}
+	if [[ $p == */ ]]; then
+		[[ -d $p ]] && ok "$p$svc" || fail "missing folder $p$svc"
+	else
+		[[ -f $p ]] && ok "$p$svc" || fail "missing file $p$svc"
+	fi
+}
+
+# ------------------------------------------------------------------- backups
+
+STATE_DIR=/var/lib/srv-host
+PAUSE_FLAG=$STATE_DIR/backups-paused
+# Jobs `box backups pause` stops: the local and remote copies of the
+# data folder, and certificate renewal (its challenge files and the new
+# certificate are pushed to the other hosts). The database dump keeps running:
+# it only writes locally.
+# shellcheck disable=SC2034 # used by cmd/box/run.sh
+PAUSABLE_JOBS="backup data-push ssl-renew"
+
+backups_paused() { [[ -f $PAUSE_FLAG ]]; }
+paused_since() { date -d "@$(stat -c %Y "$PAUSE_FLAG")" '+%Y-%m-%d %H:%M' 2>/dev/null; }
+
+
+# ------------------------------------------------------------------- migrate
+
+# host_ip NAME: address of a host of the inventory.
+host_ip() {
+	local name=$1
+	[[ " $(get hosts) " == *" $name "* ]] || die "unknown host '$name' (hosts: $(get hosts))"
+	get "${name}_ip"
+}
+
+# set_inventory KEY VALUE: in the inventory (hosts.env), keeping a dated copy
+# of the previous version.
+set_inventory() {
+	local file
+	file=$(get hosts_file)
+	set_inventory_in "$file" "$@"
+}
+
+# set_inventory_in FILE KEY VALUE [KEY VALUE...]: several changes at once,
+# without reading the inventory in between.
+set_inventory_in() {
+	local file=$1 key value backup
+	shift
+	backup="$file.$(date +%Y%m%d-%H%M%S)"
+	cp -a "$file" "$backup"
+	while [[ $# -ge 2 ]]; do
+		key=$1 value=$2
+		shift 2
+		if grep -qE "^$key=" "$file"; then
+			sed -i -E "s|^$key=.*|$key=$value|" "$file"
+		else
+			echo "$key=$value" >>"$file"
+		fi
+	done
+	chown --reference="$backup" "$file"
+	chmod --reference="$backup" "$file"
+}
+
+
+# ------------------------------------------------------------- smtp-health
+#
+# smtp.blunderer.org is the name mail clients send through (Gmail's "Send
+# mail as"). It has one address per mail host listed in smtp= (inventory) that
+# works like Gmail needs it (STARTTLS with a certificate for the name, then a
+# login with the alerts account); box smtp-health (cron, every 5 minutes, on
+# every name server) removes a host that stops working and adds it back when
+# it works again, through a signed DNS update of this host's own copy of the
+# zone (each name server is its primary; TTL 60 s). A dead host, the leader
+# included, drops out of every surviving name server's copy. It never empties
+# the record: with every host down, it keeps them all.
+
+SMTP_ZONE=smtp.blunderer.org
+smtp_key() { echo "$(get data_dir /home/data)/keys/dns/smtp-tsig.key"; }
+
+# smtp_works ADDRESS: what Gmail does with it. With the alerts account
+# (alerts set up on this host): STARTTLS on 587 with a certificate valid for
+# smtp.blunderer.org, then a login (lib/smtp_login.py). Without it, only an
+# SMTP greeting on 587. Prints the failed step.
+# shellcheck disable=SC2016 # expanded by the inner bash
+smtp_works() {
+	local user pw
+	user=$(alerts_account)
+	pw=$(alerts_pw_file)
+	if [[ -n $user && -s $pw ]]; then
+		python3 "$REPO/lib/smtp_login.py" "$1" "$SMTP_ZONE" "$user" "$pw"
+	else
+		timeout 10 bash -c 'exec 3<>"/dev/tcp/$1/587" && read -r -t 8 line <&3 && [[ $line == 220* ]]' _ "$1" 2>/dev/null ||
+			{ echo "no SMTP greeting on 587"; return 1; }
+	fi
+}
+
+# smtp_healthy_hosts: the hosts of smtp= that work (two tries 5 s apart, so one
+# dropped connection is not an outage). Why the others failed goes to
+# $STATE_DIR/smtp-health.why.
+smtp_healthy_hosts() {
+	local h ip why
+	mkdir -p "$STATE_DIR"
+	: >"$STATE_DIR/smtp-health.why"
+	for h in $(get smtp ""); do
+		ip=$(get "${h}_ip")
+		if why=$(smtp_works "$ip") || { sleep 5 && why=$(smtp_works "$ip"); }; then
+			echo "$h"
+		else
+			echo "$h ($ip): $why" | tee -a "$STATE_DIR/smtp-health.why" >&2
+		fi
+	done
+}
+
+smtp_records_for() { # smtp_records_for HOST...: sorted "TYPE ADDRESS" lines
+	local h ip6
+	for h in "$@"; do
+		echo "A $(get "${h}_ip")"
+		ip6=$(get "${h}_ip6" "")
+		[[ -z $ip6 ]] || echo "AAAA $ip6"
+	done | sort
+}
+
+# What this host's BIND serves now, as "TYPE ADDRESS" lines.
+smtp_served() {
+	{
+		{ dig +short +norecurse @127.0.0.1 "$SMTP_ZONE" A || true; } | sed 's/^/A /'
+		{ dig +short +norecurse @127.0.0.1 "$SMTP_ZONE" AAAA || true; } | sed 's/^/AAAA /'
+	} | { grep -E '^(A|AAAA) [0-9a-fA-F:.]+$' || true; } | sort
+}
+
+
+# smtp_alerter HEALTHY...: whether this host sends the alerts, so that one
+# outage gives one mail, not one per name server. The leader does, unless it
+# is a mail host found down; then the first working host of smtp= does (a
+# mail host normally runs dns too, so it has this job).
+smtp_alerter() {
+	local leader self h
+	leader=$(get leader)
+	self=$(get host)
+	# No working host at all (then no mail goes out anyway): the leader tries.
+	if (($# == 0)) || [[ " $(get smtp "") " != *" $leader "* || " $* " == *" $leader "* ]]; then
+		[[ $self == "$leader" ]]
+		return
+	fi
+	for h in $(get smtp ""); do
+		[[ " $* " == *" $h "* ]] && { [[ $h == "$self" ]]; return; }
+	done
+	return 1
+}
+
+# smtp_health_alert DOWN UP: one alert per change of the set of hosts not
+# answering, not one every 5 minutes.
+smtp_health_alert() {
+	local gone=$1 up=$2 state=$STATE_DIR/smtp-health
+	mkdir -p "$STATE_DIR"
+	[[ "$(cat "$state" 2>/dev/null)" != "$gone" ]] || return 0
+	printf '%s\n' "$gone" >"$state"
+	if [[ -z $gone ]]; then
+		echo "Every mail host works again: $SMTP_ZONE is $up." | send_alert "smtp: all hosts back"
+	elif [[ -z $up ]]; then
+		{ echo "No mail host works ($gone): $SMTP_ZONE keeps them all."; echo; cat "$STATE_DIR/smtp-health.why"; } |
+			send_alert "smtp: no host works"
+	else
+		{ echo "Removed from $SMTP_ZONE: $gone. Still in: $up."; echo; cat "$STATE_DIR/smtp-health.why"; } |
+			send_alert "smtp: $gone removed"
+	fi
+}
+
+# check_smtp_name: which hosts of smtp= this host's copy of the name leaves
+# out now.
+check_smtp_name() {
+	local served h out=() ip
+	served=$(smtp_served)
+	if [[ -z $served ]]; then
+		fail "$SMTP_ZONE has no address (srv deploy dns, then box smtp-health)"
+		return 0
+	fi
+	for h in $(get smtp ""); do
+		ip=$(get "${h}_ip")
+		grep -qxF "A $ip" <<<"$served" || out+=("$h")
+	done
+	if ((${#out[@]})); then
+		warn "$SMTP_ZONE leaves out ${out[*]}: $(xargs <"$STATE_DIR/smtp-health.why" 2>/dev/null)"
+	else
+		ok "$SMTP_ZONE: every host listed in smtp= ($(get smtp ""))"
+	fi
+}
+
+need_leader() {
+	[[ $(get is_leader no) == yes ]] ||
+		die "run this on the leader ($(get leader)); this host is $(get host)"
+	"$SRV" status dns 2>/dev/null | awk 'NR==2 && $2 ~ /^[0-9]/ {f=1} END {exit !f}' ||
+		die "the dns service is not deployed with srv on this host"
+}
+
+
+newest_dump() {
+	local d
+	d=$(find "$(get data_dir /home/data)/backups/mariadb" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort | tail -1)
+	echo "${d:-none}"
+}
+
+
+get_site_name() { echo blunderer.org; }
+
+# wait_for_slaves IP: every slave (dns_slaves) serves the new address, after
+# the master's NOTIFY. Queried with dig inside the dns container.
+wait_for_slaves() {
+	local want=$1 ns got serial deadline=$((SECONDS + 120)) pending
+	local -a slaves
+	read -ra slaves <<<"$(get dns_slaves "")"
+	serial=$("$SRV" exec dns bind dig +short @127.0.0.1 "$(get_site_name)" SOA 2>/dev/null | awk '{print $3}')
+	echo "   master: $(get_site_name) -> $("$SRV" exec dns bind dig +short @127.0.0.1 "$(get_site_name)" A 2>/dev/null) (serial $serial)"
+	while :; do
+		pending=0
+		for ns in "${slaves[@]}"; do
+			got=$("$SRV" exec dns bind dig +short +time=2 +tries=1 @"$ns" "$(get_site_name)" A 2>/dev/null | head -1)
+			[[ $got == "$want" ]] || pending=1
+		done
+		[[ $pending == 0 || $SECONDS -ge $deadline ]] && break
+		sleep 5
+	done
+	for ns in "${slaves[@]}"; do
+		got=$("$SRV" exec dns bind dig +short +time=2 +tries=1 @"$ns" "$(get_site_name)" A 2>/dev/null | head -1)
+		if [[ $got == "$want" ]]; then
+			ok "slave $ns serves $want"
+		else
+			warn "slave $ns still serves ${got:-nothing} (check its transfer: srv logs dns there)"
+		fi
+	done
+}
+
+# --------------------------------------------------------------------- audit
+
+# differs DEST GENERATOR: the file on disk is not what the generator produces.
+differs() {
+	local dest=$1
+	shift
+	! cmp -s "$dest" <("$@" 2>/dev/null) 2>/dev/null
+}
+pkg_missing() { [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null) != "install ok installed" ]]; }
+
+# audit_drift: one line per difference between this host and what the
+# repository + host env file describe, each with the box command that
+# fixes it, then a summary line. Prints nothing when everything matches.
+audit_drift() {
+	local -a lines=() fixes=()
+	add() { lines+=("  $1"$'\n'"      -> box $2"); [[ " ${fixes[*]} " == *" $2 "* ]] || fixes+=("$2"); }
+	note() { lines+=("  $1"); }
+	local p missing=() port
+
+	# hostname
+	[[ $(hostname) == "$(gen_hostname)" && $(cat /etc/hostname 2>/dev/null) == "$(gen_hostname)" ]] ||
+		add "hostname is $(hostname), the inventory says $(gen_hostname)" hostname
+	differs /etc/hosts gen_hosts && add "/etc/hosts differs from the inventory" hostname
+	[[ -d /etc/cloud ]] && differs /etc/cloud/cloud.cfg.d/99-srv.cfg gen_cloud_cfg &&
+		add "cloud-init may reset the hostname and /etc/hosts at boot" hostname
+
+	# man
+	if [[ -n $(man_wanted) && $(man_wanted) != "$(cat "$MAN_STATE" 2>/dev/null)" ]]; then
+		add "the containers' man pages do not match this host's services" man
+	fi
+
+	# ipv6
+	if [[ -n $(get "$(get host)_ip6" "") && -n $(get ip6_gw "") ]] && differs "$IPV6_UNIT" gen_ipv6_unit; then
+		add "$IPV6_UNIT differs from the host files (ip6_gw, ip6_intf)" ipv6
+	fi
+
+	# resolver
+	if resolved_installed && ! resolved_masked; then
+		add "systemd-resolved is not masked: it comes back at boot and takes port 53" resolver
+	fi
+	resolv_managed || add "/etc/resolv.conf is not box's (a link to resolved's, or rewritten by DHCP)" resolver
+	[[ " $(get services) " == *" dns "* && -n $(port_53_users) ]] &&
+		note "port 53 is used by: $(port_53_users | xargs) (the dns service needs it)"
+
+	# packages
+	for p in "${PKG_BASE[@]}" "${PKG_PODMAN[@]}"; do pkg_missing "$p" && missing+=("$p"); done
+	[[ ${#missing[@]} -gt 0 ]] && add "missing packages: ${missing[*]}" packages
+	differs /etc/apt/apt.conf.d/99srv-minimal gen_apt_minimal && add "apt still installs recommended packages" packages
+	differs /etc/tmux.conf cat "$REPO/host/tmux/tmux.conf" && add "/etc/tmux.conf differs (tmux prefix, terminal)" packages
+	differs /etc/gitconfig cat "$REPO/host/git/gitconfig" && add "/etc/gitconfig differs (git editor and identity)" packages
+	differs /etc/vim/vimrc.local cat "$REPO/host/vim/vimrc.local" && add "/etc/vim/vimrc.local differs (vim mouse)" packages
+	local su sh sf
+	while read -r su sh; do
+		for sf in "${SHELL_FILES[@]}"; do
+			differs "$sh/.$sf" cat "$REPO/host/shell/$sf" && add "$su: ~/.$sf differs from host/shell" shell
+		done
+	done < <(shell_users)
+	if [[ -d /etc/sudoers.d ]] && differs /etc/sudoers.d/srv-admin cat "$REPO/host/sudo/srv-admin"; then
+		add "/etc/sudoers.d/srv-admin differs (session-scoped sudo cache)" shell
+	fi
+	if ! pkg_missing libpam-ssh-agent-auth && [[ -f /etc/pam.d/sudo ]] &&
+		! grep -qE "^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_ssh_agent_auth\.so[[:space:]]+file=$SUDO_AUTH_KEYS([[:space:]]|\$)" /etc/pam.d/sudo; then
+		add "/etc/pam.d/sudo missing pam_ssh_agent_auth" shell
+	fi
+	[[ $(readlink -f /usr/local/bin/srv 2>/dev/null) == "$(readlink -f "$SRV")" &&
+		$(readlink -f /usr/local/bin/box 2>/dev/null) == "$(readlink -f "$REPO/box")" &&
+		$(readlink -f /usr/local/bin/remote 2>/dev/null) == "$(readlink -f "$REPO/remote")" ]] ||
+		add "srv/box/remote in /usr/local/bin do not point to this checkout" link
+
+	# podman
+	local pu puid p_home p_udir p_drift ovols
+	pu=$(unix_role)
+	differs /etc/sysctl.d/99-srv-podman.conf gen_podman_sysctl && add "Podman sysctl rules differ" podman
+	differs /etc/modules-load.d/srv-podman.conf gen_podman_modules && add "Podman kernel module list differs" podman
+	differs /etc/systemd/journald.conf.d/srv.conf cat "$REPO/host/journald/srv.conf" &&
+		add "journald size cap not installed" podman
+	differs /etc/containers/containers.conf.d/srv.conf gen_podman_containers_conf &&
+		add "/etc/containers/containers.conf.d/srv.conf differs" podman
+	if id "$pu" >/dev/null 2>&1; then
+		puid=$(id -u "$pu")
+		p_home=$(getent passwd "$pu" | cut -d: -f6)
+		p_udir="$p_home/.config/containers/systemd"
+		_subid_ok /etc/subuid "$pu" "$puid" && _subid_ok /etc/subgid "$pu" "$puid" ||
+			add "subuid/subgid missing or <65536 for $pu" podman
+		[[ $(loginctl show-user "$pu" -p Linger --value 2>/dev/null || true) == yes ]] ||
+			add "systemd linger not enabled for $pu" podman
+		differs "$p_home/.config/containers/storage.conf" gen_podman_storage_conf &&
+			add "$p_home/.config/containers/storage.conf differs (graphroot)" podman
+		if [[ -n $(get services "") ]]; then
+			for net in $("$SRV" networks); do
+				[[ -f "$p_udir/$net.network" ]] || add "quadlet network $p_udir/$net.network missing" podman
+			done
+		fi
+		load_lib secrets
+		p_drift=$(keys_podman_drift)
+		[[ -n $p_drift ]] && note "Podman secrets out of sync with $(get data_dir /home/data)/keys -> box keys sync --restart"
+	else
+		add "unix_role user '$pu' does not exist" podman
+	fi
+	[[ -n $(get services "") && ! -d $(get volumes_dir /home/volumes) ]] &&
+		add "volumes folder $(get volumes_dir /home/volumes) missing" podman
+	[[ " $(get services '') " == *" autoheal "* ]] &&
+		note "remove retired 'autoheal' from services= in $SRV_HOST_ENV"
+	[[ -d ${SRV_STATE:-/srv/releases}/autoheal ]] &&
+		note "retired autoheal release state present (box docker-remove cleans it up)"
+	ovols=$(old_volume_dirs)
+	[[ -n $ovols ]] && note "previous volume folder(s) still present ($ovols): srv deploy + srv commit moves them to $(get volumes_dir /home/volumes)"
+
+	local data_d backup_d rel p
+	data_d=$(get data_dir /home/data)
+	backup_d=$(get backup_dir /home/backup)
+	for rel in "${PROTECTED_SECRET_DIRS[@]}"; do
+		p="$data_d/$rel"
+		[[ -d $p ]] || continue
+		if [[ $(stat -c '%u:%g' "$p") != 0:0 ]] || (( (8#$(stat -c %a "$p") & 8#077) != 0 )); then
+			add "$p is not protected (expected root:root 0700)" podman
+		fi
+	done
+	if [[ -d $backup_d ]]; then
+		if [[ $(stat -c '%u:%g' "$backup_d") != 0:0 ]] || (( (8#$(stat -c %a "$backup_d") & 8#077) != 0 )); then
+			add "$backup_d is not protected (expected root:root 0700)" cron
+		fi
+	fi
+
+	# ssh
+	port=$(get ssh_port 222)
+	differs /etc/ssh/sshd_config.d/srv.conf gen_sshd_dropin && add "sshd drop-in differs (ports, hardening, AllowUsers)" ssh
+	local actual_pw want_pw
+	want_pw=$(ssh_password_auth) || return 1
+	actual_pw=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
+	[[ -z $actual_pw || $actual_pw == "$want_pw" ]] ||
+		add "sshd effective PasswordAuthentication ($actual_pw) differs from $want_pw" ssh
+	differs /etc/ssh/ssh_config.d/srv.conf gen_ssh_client && add "ssh client settings for the other hosts differ (inventory, ports)" ssh-keys
+	local auth
+	auth=$(authorized_keys_file)
+	differs "$auth" gen_authorized_keys "$auth" && add "$auth: the other hosts' keys differ (inventory or keys changed)" ssh-keys
+	cmp -s "$(host_key "$(get host)")" "/root/.ssh/id_ecdsa_$(get host)" || add "this host's ssh key is not installed in /root/.ssh" ssh-keys
+	if [[ $(get in_inventory yes) == yes ]]; then
+		differs /root/.ssh/authorized_keys gen_root_authorized_keys && add "/root/.ssh/authorized_keys differs (peer sync keys)" ssh-keys
+		differs "$SUDO_AUTH_KEYS" gen_sudo_authorized_keys && add "$SUDO_AUTH_KEYS differs (sudo ssh-agent keys)" ssh-keys
+		cmp -s "$REPO/host/ssh/srv-sync-endpoint" "$SRV_SYNC_ENDPOINT" 2>/dev/null || add "$SRV_SYNC_ENDPOINT missing or outdated" ssh-keys
+		differs "$SRV_SYNC_CONF" gen_sync_endpoint_conf && add "$SRV_SYNC_CONF missing or differs" ssh-keys
+	fi
+	grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config 2>/dev/null ||
+		add "sshd_config does not include sshd_config.d (the drop-in is ignored)" ssh
+	grep -qE '^[[:space:]]*Port[[:space:]]' /etc/ssh/sshd_config 2>/dev/null &&
+		add "sshd_config still sets Port itself" ssh
+	systemctl is-enabled ssh.socket >/dev/null 2>&1 && add "ssh socket activation is on (it ignores the port)" ssh
+	local want have
+	want=$(ssh_ports | tr ' ' '\n' | sort -n | xargs)
+	have=$(ss -Htlnp 2>/dev/null | grep -E '"sshd' | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | xargs)
+	if [[ -z $have ]]; then
+		add "sshd is not listening" ssh
+	elif [[ $have != "$want" ]]; then
+		add "sshd listens on [$have], expected [$want]" ssh
+	elif [[ $want == "22 $port" ]]; then
+		note "port 22 is still open next to $port: check 'ssh -p $port' from another terminal (and the provider firewall),"
+		note "      then -> box ssh-confirm"
+		[[ " ${fixes[*]} " == *" ssh-confirm "* ]] || fixes+=("ssh-confirm")
+	fi
+
+	# fail2ban
+	differs /etc/fail2ban/jail.local cat "$REPO/host/fail2ban/jail.local" && add "fail2ban jails differ" fail2ban
+	differs /etc/fail2ban/filter.d/srv-postfix-sasl.conf cat "$REPO/host/fail2ban/filter.d/srv-postfix-sasl.conf" &&
+		add "fail2ban SMTP AUTH filter differs" fail2ban
+	if [[ -e /etc/fail2ban/jail.d/srv-docker.local ]]; then
+		add "obsolete /etc/fail2ban/jail.d/srv-docker.local present" fail2ban
+	fi
+	differs /etc/fail2ban/jail.d/srv-sshd.local gen_fail2ban_ssh && add "fail2ban watches the wrong ssh port(s)" fail2ban
+	systemctl is-active -q fail2ban 2>/dev/null || add "fail2ban is not running" fail2ban
+
+	# cron
+	differs /etc/cron.d/srv gen_cron && add "/etc/cron.d/srv differs (services, the inventory or the repository changed)" cron
+
+	# alerts
+	if alerts_configured; then
+		differs /etc/msmtprc gen_msmtprc && add "alert mail settings differ" alerts
+		differs /etc/aliases.msmtp gen_msmtp_aliases && add "alert recipient differs" alerts
+		[[ -s "$(get data_dir /home/data)/keys/alerts/smtp_password" ]] ||
+			note "no SMTP password for alerts: run box alerts-account on the leader"
+	else
+		note "alert_email is not set: failures are not emailed (examples/example.env)"
+	fi
+
+	# services: the deployed release no longer matches what the repository and
+	# the host values (inventory included) render today.
+	local svc cur tmp deploys=()
+	for svc in $("$SRV" services 2>/dev/null | awk '{print $1}'); do
+		cur=$(readlink "${SRV_STATE:-/srv/releases}/$svc/current" 2>/dev/null) || continue
+		tmp=$(mktemp -d)
+		if "$SRV" render "$svc" "$tmp/r" >/dev/null 2>&1 &&
+			! releases_match "${SRV_STATE:-/srv/releases}/$svc/$cur" "$tmp/r"; then
+			lines+=("  $svc: release $cur differs from what the repository and host values give now"$'\n'"      -> srv deploy $svc")
+			deploys+=("$svc")
+		fi
+		rm -rf "$tmp"
+	done
+
+	[[ ${#lines[@]} -gt 0 ]] || return 0
+	printf '%s\n' "${lines[@]}"
+	[[ ${#deploys[@]} -gt 0 ]] && printf '\n  Deploy: srv deploy %s   (one at a time, then srv commit)\n' "${deploys[*]}"
+	if [[ ${#fixes[@]} -gt 0 ]]; then
+		# In setup order; ssh-confirm last (after testing the new port).
+		local ordered=() c
+		for c in link hostname ipv6 resolver packages shell man podman ssh-keys ssh fail2ban alerts cron ssh-confirm; do
+			[[ " ${fixes[*]} " == *" $c "* ]] && ordered+=("$c")
+		done
+		printf '\n  Run: box %s\n' "${ordered[*]}"
+	fi
+	return 0
+}
+
+# releases_match DIR_CUR DIR_NEW: 0 if rendered config matches after normalizing
+# release timestamps and release directory paths.
+releases_match() {
+	local dcur=$1 dnew=$2 rcur rnew pcur pnew norm rc=1
+	rcur=$(sed -n 's/^SRV_RELEASE=//p' "$dcur/.env" 2>/dev/null | head -n 1)
+	rnew=$(sed -n 's/^SRV_RELEASE=//p' "$dnew/.env" 2>/dev/null | head -n 1)
+	rcur=${rcur:-${dcur##*/}}
+	rnew=${rnew:-${dnew##*/}}
+	pcur=$(realpath -m "$dcur")
+	pnew=$(realpath -m "$dnew")
+	norm=$(mktemp -d)
+	cp -a "$dcur" "$norm/a"
+	cp -a "$dnew" "$norm/b"
+	rm -f "$norm/a/release.info" "$norm/b/release.info"
+	find "$norm/a" -type f -exec sed -i \
+		-e "s|$pcur|<RELEASE_DIR>|g" \
+		-e "s|$dcur|<RELEASE_DIR>|g" \
+		-e "s|^SRV_RELEASE=.*|SRV_RELEASE=<REL>|" \
+		-e "s|:${rcur}\([[:space:]]*\\)\$|:<REL>\\1|" {} +
+	find "$norm/b" -type f -exec sed -i \
+		-e "s|$pnew|<RELEASE_DIR>|g" \
+		-e "s|$dnew|<RELEASE_DIR>|g" \
+		-e "s|^SRV_RELEASE=.*|SRV_RELEASE=<REL>|" \
+		-e "s|:${rnew}\([[:space:]]*\\)\$|:<REL>\\1|" {} +
+	if diff -rq -I '^SRV_RELEASE=' -I '; Serial$' "$norm/a" "$norm/b" >/dev/null 2>&1; then
+		rc=0
+	fi
+	rm -rf "$norm"
+	return "$rc"
+}
+
+
+# --------------------------------------------------------------------- setup
+
+# ------------------------------------------------------------------- main
+
+load_cmd() {
+	local f="$REPO/cmd/box/$1.sh"
+	[[ -f $f ]] || die "unknown command '$1' (box help)"
+	# shellcheck source=/dev/null
+	. "$f"
+}
+
+run_cmd() {
+	local c=$1
+	shift
+	[[ $c =~ ^[a-z0-9-]+$ ]] || die "unknown command '$c' (box help)"
+	load_cmd "$c"
+	"cmd_${c//-/_}" "$@"
+}
+
+main() {
+	# -q / --quiet, anywhere: only warnings and failures (box check -q).
+	local a args=()
+	for a in "$@"; do
+		case $a in
+			-q | --quiet) BOX_QUIET=1 ;;
+			*) args+=("$a") ;;
+		esac
+	done
+	set -- "${args[@]}"
+	[[ $# -gt 0 ]] || set -- help
+	BOX_ARGS="$*"
+	case $1 in
+		# commands taking arguments
+		run | backups | data | mail | dns | tls | ban | minecraft | 		ssl-renew | keys | distdeb | migrate | leader | alert | 		ssh-trusted | check | apply-role-change | login)
+			local c=$1
+			shift
+			run_cmd "$c" "$@"
+			return
+			;;
+		smtp-health | peer-health)
+			run_cmd "$1"
+			return
+			;;
+		link | unlink)
+			[[ ${2:-} == /* ]] && { run_cmd "$1" "$2"; return; }
+			;;
+	esac
+	local cmd
+	for cmd in "$@"; do
+		case $cmd in
+			help | -h | --help) run_cmd help ;;
+			link | unlink) run_cmd "$cmd" "" ;;
+			*) run_cmd "$cmd" ;;
+		esac
+	done
+}
+
+main "$@"
