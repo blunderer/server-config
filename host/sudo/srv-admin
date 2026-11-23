@@ -1,0 +1,4 @@
+# Managed by box shell: keep SSH_AUTH_SOCK for pam_ssh_agent_auth and cache
+# sudo credentials for the duration of this terminal session.
+Defaults:%sudo env_keep += "SSH_AUTH_SOCK"
+Defaults:%sudo timestamp_type=tty, timestamp_timeout=-1

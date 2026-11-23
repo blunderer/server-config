@@ -1,0 +1,109 @@
+#!/bin/bash
+# Forced-command endpoint for root peer-to-peer sync over SSH
+# (PermitRootLogin forced-commands-only + restrict,command=... in
+# /root/.ssh/authorized_keys).
+#
+# Permits ONLY the exact commands used by data replication and checks:
+#   1. `true` (box check SSH connectivity probe)
+#   2. `sed -n 's/^leader=//p' <DATA_DIR>/configs/hosts.env` (leader-guard.sh)
+#   3. Exact rsync server command for ONLY `<DATA_DIR>/` (data-sync.sh push/pull)
+#
+# DATA_DIR is read ONLY from /etc/srv/sync-endpoint.conf
+# (0600 root:root, written by `box ssh-keys`), never from inside <DATA_DIR>.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 0077
+
+cmd=${SSH_ORIGINAL_COMMAND:-}
+[[ -n $cmd ]] || { echo "srv-sync-endpoint: interactive login is disabled" >&2; exit 126; }
+
+# Reject newlines, control chars, shell metacharacters, globs, and backslashes.
+if [[ $cmd == *$'\n'* || $cmd == *$'\r'* || $cmd == *\\* || $cmd == *[';|&$`()<>?*[]']* ]]; then
+	echo "srv-sync-endpoint: refused command" >&2
+	exit 126
+fi
+
+conf=/etc/srv/sync-endpoint.conf
+raw_data_dir=/home/data
+if [[ -f $conf ]]; then
+	if [[ $(stat -c '%u:%g' "$conf" 2>/dev/null) != 0:0 ]] || (( (8#$(stat -c %a "$conf" 2>/dev/null || echo 777) & 8#077) != 0 )); then
+		echo "srv-sync-endpoint: unsafe config $conf" >&2
+		exit 126
+	fi
+	raw_data_dir=$(sed -n 's/^DATA_DIR=//p' "$conf" | head -n 1)
+	[[ -n $raw_data_dir ]] || raw_data_dir=/home/data
+fi
+raw_data_dir=${raw_data_dir%/}
+data_dir=$(realpath -m -- "$raw_data_dir")
+[[ -n $data_dir && $data_dir != / ]] || { echo "srv-sync-endpoint: invalid DATA_DIR" >&2; exit 126; }
+
+# 1. Connectivity probe (box check).
+if [[ $cmd == true ]]; then
+	exit 0
+fi
+
+# 2. Leader guard read (backup/leader-guard.sh).
+printf -v q_raw '%q' "$raw_data_dir/configs/hosts.env"
+printf -v q_res '%q' "$data_dir/configs/hosts.env"
+if [[ $cmd == "sed -n 's/^leader=//p' $raw_data_dir/configs/hosts.env" ||
+	$cmd == "sed -n 's/^leader=//p' $data_dir/configs/hosts.env" ||
+	$cmd == "sed -n 's/^leader=//p' $q_raw" ||
+	$cmd == "sed -n 's/^leader=//p' $q_res" ]]; then
+	exec /bin/sed -n 's/^leader=//p' "$data_dir/configs/hosts.env"
+fi
+
+# 3. Exact rsync server command for <DATA_DIR>/ only:
+#   rsync --server [--sender] -<flags> [--log-format=%i] [--delete] . <DATA_DIR>/
+read -ra args <<<"$cmd"
+if ((${#args[@]} < 5 || ${#args[@]} > 8)) || [[ ${args[0]} != rsync || ${args[1]} != --server ]]; then
+	echo "srv-sync-endpoint: refused command" >&2
+	exit 126
+fi
+
+idx=2
+sender=0
+if [[ ${args[$idx]} == --sender ]]; then
+	sender=1
+	idx=$((idx + 1))
+fi
+
+# Exact short-flag bundle emitted by `rsync -rlptgo` (with optional -n/-v).
+flags=${args[$idx]:-}
+if [[ ! $flags =~ ^-[nv]*logtpre\.[A-Za-z]+$ ]]; then
+	echo "srv-sync-endpoint: refused rsync flags '$flags'" >&2
+	exit 126
+fi
+idx=$((idx + 1))
+
+# Optional --log-format=%i (emitted by --itemize-changes on -n/-v).
+log_fmt=()
+if [[ ${args[$idx]:-} == "--log-format=%i" ]]; then
+	log_fmt=("--log-format=%i")
+	idx=$((idx + 1))
+fi
+
+# Optional --delete (only for push, never --sender).
+del_opt=()
+if (( ! sender )) && [[ ${args[$idx]:-} == --delete ]]; then
+	del_opt=(--delete)
+	idx=$((idx + 1))
+fi
+
+# Must end with exact `. <DATA_DIR>/` and no extra arguments.
+if ((idx + 2 != ${#args[@]})) || [[ ${args[$idx]} != . ]]; then
+	echo "srv-sync-endpoint: refused command" >&2
+	exit 126
+fi
+
+target=${args[$((idx + 1))]}
+if [[ $target != "$raw_data_dir/" && $target != "$data_dir/" ]]; then
+	echo "srv-sync-endpoint: refused target '$target'" >&2
+	exit 126
+fi
+
+safe_opts=(--no-D --no-devices --no-specials --safe-links "--chmod=Dug-s,Fug-s")
+if ((sender)); then
+	exec /usr/bin/rsync --server --sender "$flags" "${log_fmt[@]}" "${safe_opts[@]}" . "$data_dir/"
+else
+	exec /usr/bin/rsync --server "$flags" "${log_fmt[@]}" "${del_opt[@]}" "${safe_opts[@]}" . "$data_dir/"
+fi
