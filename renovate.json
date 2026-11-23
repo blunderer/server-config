@@ -1,0 +1,71 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests"
+  ],
+  "baseBranches": [
+    "srv"
+  ],
+  "dependencyDashboard": true,
+  "enabledManagers": [
+    "dockerfile",
+    "custom.regex",
+    "github-actions"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "^services/.+/quadlet/.+\\.container(\\.tmpl)?$"
+      ],
+      "matchStrings": [
+        "Image=(?<depName>[a-z0-9-]+(?:\\.[a-z0-9-]+)+/[^:@\\s]+):(?<currentValue>[^@\\s]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "(^|/)Dockerfile$"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\nARG [A-Z_]+_VERSION=(?<currentValue>[^\\s]+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "^ssl/acme\\.conf$"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\n[A-Z_]+=\"[^:\"]+:(?<currentValue>[^\"@\\s]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?\""
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Local base images built by srv pull Debian/PHP updates at build time",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "pinDigests": false
+    },
+    {
+      "description": "Keep third-party Jellyfin base image digest-pinned in its wrapper Dockerfile",
+      "matchPackageNames": [
+        "lscr.io/linuxserver/jellyfin"
+      ],
+      "pinDigests": true
+    },
+    {
+      "description": "Major upgrades (MariaDB, PHP, BIND, Debian) need a test on vega",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "labels": [
+        "test-on-vega"
+      ]
+    }
+  ]
+}

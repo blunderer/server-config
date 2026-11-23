@@ -1,0 +1,102 @@
+name: ci
+
+on:
+  push:
+    branches: [srv, podman]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x srv box remote backup/*.sh ssl/renew.sh ci/*.sh lib/*.sh cmd/srv/*.sh cmd/box/*.sh host/shell/completion.bash \
+            services/onion/image/srv-tor-health \
+            services/mail/image/mail/srv-postfix \
+            services/jellyfin/config/entrypoint.sh \
+            services/web/config/entrypoint.d/*.sh
+          for d in services/*/hooks; do
+            (cd "$d" && shellcheck -x -P . -P ../../.. $(find . -type f))
+          done
+      - name: install podman for Quadlet generator validation
+        run: sudo apt-get update -q && sudo apt-get install -y -q podman
+      - name: render and validate every service with the example host files
+        run: SRV_HOST_ENV=examples/example.env SRV_HOSTS_ENV=examples/example-hosts.env ./srv check
+      - name: no mount inside a read-only mount
+        run: ci/check-mounts.sh
+      - name: modular command cross-reference check
+        run: python3 ci/check-cmd-refs.py
+
+  configs:
+    # Every rendered configuration loaded by the daemon that reads it, in the
+    # real images (BIND, nginx, postfix, OpenDKIM, OpenARC, PostSRSd, tor),
+    # plus the fail2ban filter and jails.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q fail2ban python3-systemd tmux
+      - run: sudo ci/validate-configs.sh
+
+  images:
+    # Builds the images srv builds on the servers, so a broken Dockerfile or a
+    # missing Debian package shows up here first.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - services/mail/image/mail
+          - services/mail/image/openarc
+          - services/mail/image/resolver
+          - services/web/image/php
+          - services/onion/image
+          - services/jellyfin/image
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --pull -t ci-image ${{ matrix.image }}
+      - name: smoke test
+        run: |
+          case "${{ matrix.image }}" in
+            */mail/image/mail)
+              docker run --rm ci-image sh -c 'postconf mail_version && dpkg-query -W -f "postsrsd \${Version}\n" postsrsd | grep "^postsrsd 2\." && opendkim -V | head -1; command -v policyd-spf'
+              # SMTP AUTH path: postfix (not root) must reach saslauthd's
+              # socket and get a test account accepted.
+              docker run --rm ci-image sh -c '
+                set -e
+                useradd -M ci-sasl && echo ci-sasl:ci-password | chpasswd
+                mkdir -p /run/saslauthd && saslauthd -a shadow -m /run/saslauthd -n 1 && sleep 1
+                ls -ld /run/saslauthd
+                su -s /bin/sh postfix -c "testsaslauthd -f /run/saslauthd/mux -u ci-sasl -p ci-password -s smtp"'
+              # OpenDKIM runs as uid 1000 and rejects every key if that uid
+              # has no name (RequireSafeKeys).
+              docker run --rm --user 1000:1000 --entrypoint id ci-image -un ;;
+            */openarc)
+              docker run --rm --entrypoint openarc ci-image -V
+              docker run --rm --user 1000:1000 --entrypoint id ci-image -un ;;
+            */resolver) docker run --rm --entrypoint unbound ci-image -V | head -1 ;;
+            */php) docker run --rm ci-image php -m ;;
+            */onion/image) docker run --rm --entrypoint tor ci-image --version ;;
+            */jellyfin/image)
+              docker run --rm --entrypoint sh ci-image -c '
+                set -e
+                command -v curl >/dev/null
+                command -v awk >/dev/null
+                target=$(readlink -f /usr/lib/jellyfin/bin/libe_sqlite3.so)
+                case "$target" in */libsqlite3.so.*) test -r "$target" ;; *) exit 1 ;; esac' ;;
+          esac
+
+  upstream-images:
+    # Healthchecks run tools inside third-party images: make sure they exist.
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -e
+          check() { docker run --rm --entrypoint sh "$1" -c "command -v $2" >/dev/null || { echo "$2 missing in $1"; exit 1; }; }
+          check internetsystemsconsortium/bind9:9.20 dig
+          check internetsystemsconsortium/bind9:9.20 named-checkconf
+          check nginx:1.30-alpine wget
+          check lscr.io/linuxserver/transmission:4.1.4 curl
+          check lscr.io/linuxserver/wireguard:1.0.20260223 wg
