@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Stop sharing a folder with an agent (srv hook agy share):
+#   srv hook agy unshare [INSTANCE] NAME [discard]
+# The overlay is unmounted; the agent's changes stay in overlay/NAME/upper
+# (under volumes_dir/agy[-<instance>]-shares) to look at or copy, unless "discard"
+# deletes them. The original folder was never written.
+set -euo pipefail
+# shellcheck source=services/agy/hooks/lib.sh
+. "$(dirname "$0")/lib.sh"
+inst=''
+if [[ -n ${1:-} && " $(agy_instances) " == *" $1 "* ]]; then inst=$1; shift; fi
+name=${1:?usage: srv hook agy unshare [instance] <name> [discard]}
+[[ $name =~ ^[A-Za-z0-9._-]+$ && $name != .* ]] || { echo "name: letters, digits, . _ - (not starting with .)" >&2; exit 2; }
+[[ -n $inst ]] || inst=$(agy_pick "")
+base=$(agy_share_base "$inst")
+if [[ ! -s $base/shares ]] || ! awk -v n="$name" '$1 == n { f=1; exit } END { exit !f }' "$base/shares"; then
+	echo "$inst: no share $name (srv hook agy share $inst)" >&2
+	exit 1
+fi
+if mountpoint -q "$base/shared/$name"; then
+	umount "$base/shared/$name" || { echo "$name is in use: stop what the agent runs in /shared/$name, or umount -l $base/shared/$name" >&2; exit 1; }
+fi
+rmdir "$base/shared/$name" 2>/dev/null || true
+awk -v n="$name" '$1 != n' "$base/shares" >"$base/shares.new"
+mv "$base/shares.new" "$base/shares"
+if [[ ${2:-} == discard ]]; then
+	rm -rf "${base:?}/overlay/$name"
+	echo "$inst: $name no longer shared; its changes deleted"
+else
+	echo "$inst: $name no longer shared; its changes are in $base/overlay/$name/upper"
+	echo "   (deleted files there are character devices 0/0: overlayfs' whiteouts)"
+fi

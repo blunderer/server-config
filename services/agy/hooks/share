@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Share a host folder with an agent, read-only, through a writable overlay:
+# the agent sees it as /shared/NAME and can change anything in it, but the
+# original folder is never written; its changes land in a folder of their
+# own (overlay/NAME/upper under volumes_dir/agy[-<instance>]-shares).
+#   srv hook agy share [INSTANCE] FOLDER [NAME]   share (NAME: the folder's name)
+#   srv hook agy share [INSTANCE]                 list, and mount again what is
+#                                                 recorded (after a reboot: cron)
+# INSTANCE may be left out when there is one (with no FOLDER: all of them).
+# Stop sharing: srv hook agy unshare [INSTANCE] NAME [discard].
+set -euo pipefail
+# shellcheck source=services/agy/hooks/lib.sh
+. "$(dirname "$0")/lib.sh"
+inst=''
+if [[ -n ${1:-} && " $(agy_instances) " == *" $1 "* ]]; then inst=$1; shift; fi
+folder=${1:-}
+name=${2:-}
+
+if [[ -z $folder ]]; then
+	rc=0
+	for i in ${inst:-$(agy_instances)}; do
+		base=$(agy_share_base "$i")
+		[[ -s $base/shares ]] || { echo "$i: nothing shared"; continue; }
+		while read -r n f; do
+			agy_mount "$i" "$n" "$f" || rc=1
+			echo "   $(find "$base/overlay/$n/upper" -mindepth 1 2>/dev/null | wc -l) changed path(s) in $base/overlay/$n/upper"
+		done <"$base/shares"
+	done
+	exit "$rc"
+fi
+
+[[ -n $inst ]] || inst=$(agy_pick "")
+folder=$(realpath -e "$folder") || { echo "no folder $1" >&2; exit 1; }
+[[ -d $folder ]] || { echo "$folder is not a folder" >&2; exit 1; }
+agy_check_share "$folder" || exit 1
+[[ $folder != *[,:]* ]] || { echo "$folder: a path with , or : cannot be an overlay's lower folder" >&2; exit 1; }
+name=${name:-$(basename "$folder")}
+[[ $name =~ ^[A-Za-z0-9._-]+$ && $name != .* ]] || { echo "name: letters, digits, . _ - (not starting with .)" >&2; exit 2; }
+base=$(agy_share_base "$inst")
+mkdir -p "$base/shared"
+if [[ -s $base/shares ]] && awk -v n="$name" '$1 == n { f=1; exit } END { exit !f }' "$base/shares"; then
+	[[ $(awk -v n="$name" '$1 == n {print $2}' "$base/shares") == "$folder" ]] ||
+		{ echo "$inst: $name is already the share of another folder (srv hook agy unshare $inst $name)" >&2; exit 1; }
+else
+	echo "$name $folder" >>"$base/shares"
+fi
+agy_mount "$inst" "$name" "$folder"

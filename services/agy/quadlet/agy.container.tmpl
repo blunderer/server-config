@@ -1,0 +1,39 @@
+[Unit]
+Description=Antigravity CLI agent (@svc@)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=@container@
+HostName=@hostname@
+Image=localhost/srv/agy:${SRV_RELEASE}
+Network=pasta:-4
+UserNS=keep-id
+User=1000:1000
+RunInit=true
+DropCapability=CAP_NET_RAW CAP_MKNOD
+PidsLimit=512
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_VOLUMES}/@home_vol@:/home/agy
+Volume=${SRV_VOLUMES}/@work_vol@:/work
+Volume=${SRV_VOLUMES}/@shares_vol@/shared:/shared:rslave
+HealthCmd=tmux has-session -t agy
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=@agy_mem@ --log-opt=tag=@log_tag@
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+OOMScoreAdjust=300
+
+[Install]
+WantedBy=default.target

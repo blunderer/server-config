@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# The container's process: keeps a tmux session named agy running agy with
+# Remote Control on. tmux runs detached (nothing drawn into the journal);
+# this script lives as long as the session, so the container stops, and
+# restarts, if it ends. Inside, agy starts again 10 s after it exits (not
+# signed in yet, an update, a crash).
+# srv hook agy register: the session, e.g. to sign in the first time.
+set -euo pipefail
+cd /work
+tmux new-session -d -s agy -n agy -x 200 -y 50 bash -c '
+	while :; do
+		args=(--remote-control)
+		if last_id=$(python3 - <<PY 2>/dev/null
+import os, sqlite3, sys
+db = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+if not os.path.exists(db):
+    sys.exit(0)
+con = sqlite3.connect(db)
+row = con.execute(
+    "SELECT conversation_id FROM conversation_summaries "
+    "WHERE nesting_depth = 0 AND step_count > 0 "
+    "ORDER BY last_modified_time DESC LIMIT 1"
+).fetchone()
+if row and os.path.exists(os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{row[0]}.db")):
+    print(row[0])
+PY
+		) && [[ -n $last_id ]]; then
+			args+=(--conversation "$last_id")
+		fi
+		agy "${args[@]}"
+		echo
+		echo "agy exited ($?): starting again in 10 s (to sign in, answer agy; Ctrl-b d leaves this)"
+		sleep 10
+	done'
+while tmux has-session -t agy 2>/dev/null; do sleep 5; done

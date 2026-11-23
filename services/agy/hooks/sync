@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Copy an agent's workspace to a folder on the host. The workspace is its
+# work volume, /work in its container.
+#   srv hook agy sync [INSTANCE] [TARGET] [PROJECT]
+#   INSTANCE  a name of agy_instances (may be left out when there is one)
+#   TARGET    where to (default: agy_sync_dir in the host file, plus
+#             /<instance> when there are several instances)
+#   PROJECT   one folder of the workspace (default: all of it)
+# Files keep dates and are owned by data_owner (uid 1000); symlinks escaping
+# the synced tree, special files and setuid/setgid bits are refused/stripped.
+# Files gone from the workspace stay in TARGET unless SRV_SYNC_DELETE=1.
+set -euo pipefail
+# shellcheck source=lib/data-owner.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/data-owner.sh"
+# shellcheck source=services/agy/hooks/lib.sh
+. "$(dirname "$0")/lib.sh"
+data_owner_init "${SRV_DATA:-/home/data}"
+
+if [[ -n ${1:-} && " $(agy_instances) " == *" $1 "* ]]; then
+	inst=$1
+	shift
+else
+	inst=$(agy_pick "")
+fi
+target=${1:-}
+project=${2:-}
+if [[ -z $target && -n ${SRV_V_agy_sync_dir:-} ]]; then
+	target=$SRV_V_agy_sync_dir
+	(($(wc -w <<<"$(agy_instances)") == 1)) || target+=/$inst
+fi
+[[ -n $target ]] || { echo "usage: srv hook agy sync [instance] <target> [project] (or agy_sync_dir in the host file)" >&2; exit 2; }
+[[ ! -L $target ]] || { echo "target $target is a symlink: refused" >&2; exit 1; }
+target=$(realpath -m "$target")
+data=$(realpath -m "${SRV_DATA:-/home/data}")
+vols=$(realpath -m "${SRV_VOLUMES:-${SRV_V_volumes_dir:-/home/volumes}}")
+rvols=$(agy_running_volumes_dir)
+case $target in
+	/ | /etc | /etc/* | /root | /root/* | /var | /var/* | /usr | /usr/* | \
+	/bin | /bin/* | /sbin | /sbin/* | /lib | /lib/* | /boot | /boot/* | \
+	/proc | /proc/* | /sys | /sys/* | /dev | /dev/* | /run | /run/* | \
+	*/.ssh | */.ssh/* | */keys | */keys/*)
+		echo "$target: refused as sync target (system, ssh or key folder)" >&2
+		exit 1
+		;;
+esac
+if [[ $target == "$data/keys" || $target == "$data/keys"/* || $data/keys == "$target"/* ||
+	$target == "$data/users" || $target == "$data/users"/* || $data/users == "$target"/* ]]; then
+	echo "$target: refused as sync target (contains or is inside $data/{keys,users})" >&2
+	exit 1
+fi
+if [[ $target == "$vols" || $target == "$vols"/* || $vols == "$target"/* ]]; then
+	echo "$target: refused as sync target (contains or is inside $vols)" >&2
+	exit 1
+fi
+if [[ -n $rvols ]]; then
+	rvols=$(realpath -m "$rvols")
+	if [[ $target == "$rvols" || $target == "$rvols"/* || $rvols == "$target"/* ]]; then
+		echo "$target: refused as sync target (contains or is inside $rvols)" >&2
+		exit 1
+	fi
+fi
+
+src=$(agy_work_dir "$inst")
+[[ -n $src && -d $src ]] ||
+	{ echo "no work volume folder for $inst: srv deploy agy first" >&2; exit 1; }
+[[ ! -L $src && -d $src ]] || { echo "work volume path $src is invalid" >&2; exit 1; }
+if [[ -n $project ]]; then
+	[[ $project != */* && $project != .* ]] || { echo "project: a folder name of the workspace" >&2; exit 2; }
+	[[ ! -L $src/$project ]] || { echo "$project in $inst's workspace is a symlink: refused" >&2; exit 1; }
+	[[ -d $src/$project ]] ||
+		{ echo "no $project in $inst's workspace; there are: $(find "$src" -mindepth 1 -maxdepth 1 -type d -printf '%f ')" >&2; exit 1; }
+	src=$src/$project
+fi
+mkdir_own "$target"
+owner=${DATA_OWNER:-1000:1000}
+opts=(-a --safe-links --no-devices --no-specials --chmod=ugo-s --info=stats1)
+[[ $(id -u) != 0 ]] || opts+=("--chown=$owner")
+[[ ${SRV_SYNC_DELETE:-0} != 1 ]] || opts+=(--delete)
+rsync "${opts[@]}" "$src/" "$target/"
+echo "synced $inst${project:+/$project} to $target"

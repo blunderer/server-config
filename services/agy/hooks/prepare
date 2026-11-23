@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Before the containers are created: the CPU must have AES-NI, without which
+# agy stops with an illegal instruction (Google's requirement); each
+# instance's volumes must exist (home, work and shares under volumes_dir, kept
+# across releases); and any recorded shares are mounted again.
+set -euo pipefail
+if ! grep -qw aes /proc/cpuinfo; then
+	echo "this CPU has no AES-NI (aes in /proc/cpuinfo): agy cannot run here" >&2
+	exit 1
+fi
+for v in ${SRV_V_agy_volume_names:-agy-home agy-work agy-shares}; do
+	d="${SRV_VOLUMES:?}/$v"
+	new=0
+	[[ -d $d ]] || new=1
+	if [[ $v == *-shares ]]; then
+		install -d -m 0755 -o 1000 -g 1000 "$d" "$d/shared"
+	else
+		install -d -m 0750 -o 1000 -g 1000 "$d"
+		if [[ $v == *-home && -d /etc/skel && -z $(ls -A "$d") ]]; then
+			cp -a /etc/skel/. "$d/"
+			chown -R 1000:1000 "$d"
+		fi
+	fi
+	((new == 0)) || echo "created volume folder $d"
+done
+"$(dirname "$0")/share"

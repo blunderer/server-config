@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Open an agent's session (tmux, in its container) to sign agy in to your
+# Google account: srv hook agy register [INSTANCE]. agy prints an
+# authorization URL; open it on any device, sign in, paste the code back.
+# Remote Control then starts. Ctrl-b d leaves the session running (Ctrl-c
+# would stop agy, which starts again 10 s later). INSTANCE: a name of
+# agy_instances, needed when there are several. Each instance signs in on
+# its own.
+set -euo pipefail
+# shellcheck source=services/agy/hooks/lib.sh
+. "$(dirname "$0")/lib.sh"
+# shellcheck source=lib/runtime.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/runtime.sh"
+inst=$(agy_pick "${1:-}")
+svc=$(agy_service "$inst")
+cid=$(rt_find_container agy "$svc" "srv-$svc")
+rt=$(rt_service_runtime agy 2>/dev/null || true)
+[[ -n $rt ]] || { echo "agy is not deployed here: srv deploy agy" >&2; exit 1; }
+[[ -n $cid ]] || { echo "the container of $inst is not running: srv status agy" >&2; exit 1; }
+[[ -t 0 && -t 1 ]] || { echo "this needs a terminal (with remote: remote <host> sudo srv hook agy register $inst)" >&2; exit 2; }
+echo "Opening the session of $inst. Sign in if asked; leave with Ctrl-b d."
+sleep 1
+rt_exec_podman_user podman exec -it "${cid#podman:}" tmux attach -t agy
