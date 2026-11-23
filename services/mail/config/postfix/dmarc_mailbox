@@ -1,0 +1,3 @@
+# Local Maildirs, under virtual_mailbox_base (the mail-reports volume folder).
+# The trailing slash makes it a Maildir.
+reports@dmarc.invalid   dmarc/

@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Before the containers are created: make sure the files the mail containers mount
+# exist (docker would otherwise create empty directories in their place).
+set -euo pipefail
+# Files created here belong to the data folder's owner, not root.
+# shellcheck source=lib/data-owner.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/data-owner.sh"
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/runtime.sh"
+data_owner_init "$SRV_DATA"
+
+[[ -d ${SRV_VOLUMES:?}/mail-spool ]] || install -d -m 0755 -o "$(rt_host_id uid 0)" -g "$(rt_host_id gid 0)" "$SRV_VOLUMES/mail-spool"
+[[ -d $SRV_VOLUMES/mail-reports ]] || install -d -m 0750 -o "$(rt_host_id uid 5000)" -g "$(rt_host_id gid 5000)" "$SRV_VOLUMES/mail-reports"
+[[ -d $SRV_VOLUMES/mail-saslauthd ]] || install -d -m 0710 -o "$(rt_host_id uid 0)" -g "$(rt_host_id gid 45)" "$SRV_VOLUMES/mail-saslauthd"
+
+secret="$SRV_DATA/keys/postsrsd/postsrsd.secret"
+if [[ ! -s $secret ]]; then
+	install -d -m 0700 -o 0 -g 0 "$(dirname "$secret")"
+	(umask 077 && head -c 24 /dev/urandom | base64 >"$secret")
+	chown 0:0 "$secret"
+	chmod 0600 "$secret"
+	echo "created $secret: copy it to every mail host (it is in the replicated data folder)"
+fi
+
+# The forwarding table lives in the data folder (box mail config). A new
+# setup normally gets it with the data folder; otherwise it starts empty.
+virtual="$SRV_DATA/configs/mail/virtual"
+if [[ ! -f $virtual ]]; then
+	mkdir_own "$(dirname "$virtual")"
+	printf '%s\n' "# Forwarding table: <address> <destination>[, <destination>...]" \
+		"# Edit with: box mail config" >"$virtual"
+	own "$virtual"
+	echo "created an empty $virtual: add the forwarding addresses with box mail config"
+fi
+
+# The senders table: which SMTP login may use which envelope sender. When
+# missing, it starts by letting every current login send as any address of
+# our domains; narrow it with box mail config.
+senders="$SRV_DATA/configs/mail/senders"
+if [[ ! -f $senders ]]; then
+	mkdir_own "$(dirname "$senders")"
+	logins=$(awk -F: '$2 ~ /^\$/ {print $1}' "$SRV_DATA/users/postfix/shadow" 2>/dev/null | paste -sd, - | sed 's/,/, /g')
+	{
+		echo "# Senders: <address|@domain> <login>[, <login>...] (edit with: box mail config)."
+		echo "# A logged-in client may only send as the addresses its login owns here."
+		if [[ -n $logins ]]; then
+				domains=$(sed -n 's/^virtual_alias_domains *= *//p' "${SRV_ROOT:-$(dirname "$0")/../../..}/services/mail/config/postfix/main.cf")
+			for d in $domains; do
+				printf '@%-23s %s\n' "$d" "$logins"
+			done
+		fi
+	} >"$senders"
+	own "$senders"
+	echo "created $senders: every login may send as any address of our domains; narrow it with box mail config"
+fi
+chmod 755 "$SRV_DATA/configs/mail" 2>/dev/null || true
+chmod 644 "$virtual" "$senders" 2>/dev/null || true
+if [[ -d $SRV_DATA/users/postfix ]]; then
+	chmod 750 "$SRV_DATA/users/postfix" 2>/dev/null || true
+	chmod 640 "$SRV_DATA/users/postfix"/{passwd,group,shadow} 2>/dev/null || true
+fi
+
+# shellcheck source=services/mail/hooks/requirements.sh
+. "$(dirname "$0")/requirements.sh"
+
+missing=0
+for f in keys/ssl/blunderer.org/fullchain.crt keys/ssl/blunderer.org/blunderer.org.key \
+	users/postfix/passwd users/postfix/shadow users/postfix/group; do
+	if [[ ! -f $SRV_DATA/$f ]]; then
+		echo "missing $SRV_DATA/$f" >&2
+		missing=1
+	fi
+done
+
+checked_dirs=" "
+if [[ -d $SRV_DATA/keys/opendkim ]]; then
+	downer=$(stat -c %u "$SRV_DATA/keys/opendkim")
+	dmode=$(stat -c %a "$SRV_DATA/keys/opendkim")
+	if [[ ($downer != 1000 && $downer != 0) ]] || (((8#$dmode & 8#022) != 0)); then
+		echo "unsafe key directory $SRV_DATA/keys/opendkim (uid $downer, mode $dmode; opendkim/openarc require uid 1000 or 0 and no group/other write)" >&2
+		missing=1
+	fi
+	checked_dirs+="$SRV_DATA/keys/opendkim "
+fi
+while read -r f; do
+	[[ -n $f ]] || continue
+	if [[ ! -s $SRV_DATA/$f ]]; then
+		echo "missing $SRV_DATA/$f" >&2
+		missing=1
+		continue
+	fi
+	d=$(dirname "$SRV_DATA/$f")
+	if [[ $checked_dirs != *" $d "* ]]; then
+		downer=$(stat -c %u "$d")
+		dmode=$(stat -c %a "$d")
+		if [[ ($downer != 1000 && $downer != 0) ]] || (((8#$dmode & 8#022) != 0)); then
+			echo "unsafe key directory $d (uid $downer, mode $dmode; opendkim/openarc require uid 1000 or 0 and no group/other write)" >&2
+			missing=1
+		fi
+		checked_dirs+="$d "
+	fi
+	owner=$(stat -c %u "$SRV_DATA/$f")
+	mode=$(stat -c %a "$SRV_DATA/$f")
+	if [[ ($owner != 1000 && $owner != 0) ]] || (((8#$mode & 8#077) != 0)); then
+		echo "unsafe key $SRV_DATA/$f (uid $owner, mode $mode; opendkim/openarc require uid 0 or 1000 and mode 0600)" >&2
+		missing=1
+	fi
+done < <(service_requirements "${SRV_RELEASE_DIR:+$SRV_RELEASE_DIR/config}")
+
+if [[ $missing == 1 ]]; then
+	echo "see docs/migration.md, \"Files to check in the data folder\"" >&2
+	exit 1
+fi

@@ -1,0 +1,33 @@
+[Unit]
+Description=Mail stack recursive DNS resolver (Unbound)
+
+[Container]
+ContainerName=srv-mail-resolver
+Pod=srv-mail.pod
+Image=localhost/srv/mail-resolver:${SRV_RELEASE}
+User=0:0
+DropCapability=ALL
+AddCapability=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+PidsLimit=128
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_RELEASE_DIR}/config/unbound.conf:/etc/srv/unbound.conf:ro
+HealthCmd=unbound-control -c /etc/srv/unbound.conf status
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=256m --log-opt=tag=unbound
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Start postfix in the foreground with the configuration of this release.
+# /etc/srv/postfix is the rendered config (read-only); postfix also needs the
+# package files in /etc/postfix, so the config is copied over them.
+set -e
+
+cp -R /etc/srv/postfix/. /etc/postfix/
+cp /etc/srv/policyd-spf.conf /etc/postfix-policyd-spf-python/policyd-spf.conf
+
+# The queue lives in a volume shared by every release; fix ownership in case
+# a newer package changed the postfix uid/gid.
+postfix set-permissions >/dev/null 2>&1 || true
+# The local Maildirs (DMARC reports, main.cf) belong to virtual_uid_maps.
+install -d -o 5000 -g 5000 -m 0750 /var/mail/reports
+postfix check
+
+exec postfix start-fg

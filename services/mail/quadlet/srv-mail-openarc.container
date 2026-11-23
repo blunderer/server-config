@@ -1,0 +1,36 @@
+[Unit]
+Description=Mail ARC milter (OpenARC)
+Wants=srv-mail-resolver.service
+After=srv-mail-resolver.service
+
+[Container]
+ContainerName=srv-mail-openarc
+Pod=srv-mail.pod
+Image=localhost/srv/mail-openarc:${SRV_RELEASE}
+User=1000:1000
+DropCapability=ALL
+NoNewPrivileges=true
+PidsLimit=128
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_RELEASE_DIR}/config/openarc:/etc/srv/openarc:ro
+Volume=/run/systemd/journal/dev-log:/dev/log
+@openarc_secrets@
+HealthCmd=nc -z -w 2 127.0.0.1 12302
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=128m --log-opt=tag=openarc
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

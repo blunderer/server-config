@@ -1,0 +1,12 @@
+# NAME DOMAIN:SELECTOR:KEY FILE
+# NAME is only a label, the one SigningTable refers to: here the domain. What
+# goes in the signature (and names the DNS record SELECTOR._domainkey.DOMAIN)
+# is SELECTOR. A key rotation changes SELECTOR and the file, not the label
+# (box keys help dkim).
+
+blunderer.org blunderer.org:s202611:/keys/blunderer.org/s202611.private
+lelong.xyz lelong.xyz:s202611:/keys/lelong.xyz/s202611.private
+n.lelong.xyz n.lelong.xyz:s202611:/keys/lelong.xyz/s202611.private
+rion.lelong.xyz rion.lelong.xyz:s202611:/keys/lelong.xyz/s202611.private
+libroxml.net libroxml.net:s202611:/keys/libroxml.net/s202611.private
+libroxml.com libroxml.com:s202611:/keys/libroxml.com/s202611.private

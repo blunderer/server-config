@@ -1,0 +1,152 @@
+# Postfix main configuration (rendered by srv).
+#
+# Role: receive mail for the domains in virtual_alias_domains and forward it
+# (virtual table, mostly to Gmail); relay mail for authenticated users.
+# Forwarding is done so Gmail can trust it:
+#   - SRS rewrites the envelope sender (SPF passes for blunderer.org),
+#   - OpenARC seals what this server verified on arrival (ARC),
+#   - nothing touches the message body or signed headers (DKIM survives).
+# See docs/mail.md.
+
+compatibility_level = 3.6
+
+# --- Identity ---------------------------------------------------------------
+myhostname = @server_name@
+mydomain = @server_name@
+myorigin = blunderer.org
+mydestination = localhost
+smtpd_banner = $myhostname ESMTP
+biff = no
+append_dot_mydomain = no
+readme_directory = no
+
+# --- Logging: to the container's stdout, collected by journald ---------------
+maillog_file = /dev/stdout
+
+# --- Network ----------------------------------------------------------------
+inet_interfaces = all
+inet_protocols = all
+# Outgoing mail: "any" (IPv6 when the destination has it) when this host's
+# IPv6 address is in the inventory, so its mail name has an AAAA record;
+# "ipv4" otherwise, as Gmail rejects an IPv6 source without matching reverse
+# and forward names. The reverse names are set at the hosting provider
+# (box check verifies them). Receiving over IPv6 works either way.
+smtp_address_preference = @smtp_address_preference@
+# Only pod loopback. NEVER add any bridge/pasta subnet: clients
+# reaching a published port can appear with a non-loopback address, which
+# would make the server an open relay.
+mynetworks = 127.0.0.0/8 [::1]/128
+message_size_limit = 20480000
+mailbox_size_limit = 0
+recipient_delimiter = +
+alias_maps =
+alias_database =
+
+# --- TLS --------------------------------------------------------------------
+smtpd_tls_cert_file = /keys/ssl/blunderer.org/fullchain.crt
+smtpd_tls_key_file = /keys/ssl/blunderer.org/blunderer.org.key
+smtpd_tls_security_level = may
+smtpd_tls_auth_only = yes
+smtpd_tls_protocols = >=TLSv1.2
+smtpd_tls_mandatory_protocols = >=TLSv1.2
+smtpd_tls_mandatory_ciphers = high
+smtpd_tls_loglevel = 1
+smtp_tls_security_level = may
+smtp_tls_protocols = >=TLSv1.2
+smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt
+smtp_tls_loglevel = 1
+
+# --- Authentication (Cyrus SASL through the saslauthd container) -------------
+smtpd_sasl_auth_enable = yes
+smtpd_sasl_type = cyrus
+smtpd_sasl_path = smtpd
+cyrus_sasl_config_path = /etc/postfix/sasl
+# No smtpd_sasl_local_domain: postfix would append it to every login
+# ("alerts" became "alerts@lelong.xyz"), and the senders table, which names
+# the bare logins, would refuse everything. saslauthd ignores the realm
+# anyway (no -r), so logging in is unchanged.
+smtpd_sasl_security_options = noanonymous
+broken_sasl_auth_clients = yes
+
+# --- Restrictions -----------------------------------------------------------
+smtpd_helo_required = yes
+smtpd_helo_restrictions =
+	permit_mynetworks
+	permit_sasl_authenticated
+	reject_invalid_helo_hostname
+	reject_non_fqdn_helo_hostname
+	reject_unknown_helo_hostname
+
+smtpd_relay_restrictions =
+	permit_mynetworks
+	permit_sasl_authenticated
+	reject_unauth_destination
+
+smtpd_recipient_restrictions =
+	# A logged-in client may only use the envelope senders its login owns in
+	# the senders table (box mail config); anything else, foreign domains
+	# included, is refused. Unauthenticated clients are not affected here.
+	reject_authenticated_sender_login_mismatch
+	permit_sasl_authenticated
+	permit_mynetworks
+	reject_unauth_destination
+	# Unauthenticated clients may not use our domains as envelope sender:
+	# stops the "spam from my own address" forwarded to Gmail.
+	check_sender_access texthash:/etc/postfix/own_domains
+	# Records SPF results in Authentication-Results (never rejects); OpenARC
+	# copies them into the ARC seal.
+	check_policy_service unix:private/policyd-spf
+	# Every RBL/RHSBL names the valid listing codes explicitly. Without this a
+	# zone's ERROR replies (Spamhaus returns 127.255.255.x for a query through a
+	# public/shared resolver, over quota, etc.) count as a listing and reject
+	# all mail. Restricted, an error is simply "not listed" and mail flows.
+	# Real listings: DBL 127.0.1.2-99, ZEN 127.0.0.2-11 (see also docs/mail.md).
+	reject_rhsbl_helo dbl.spamhaus.org=127.0.1.[2..99]
+	reject_rhsbl_reverse_client dbl.spamhaus.org=127.0.1.[2..99]
+	reject_rhsbl_sender dbl.spamhaus.org=127.0.1.[2..99]
+	permit_dnswl_client list.dnswl.org=127.0.[0..255].[1..3]
+	reject_rbl_client zen.spamhaus.org=127.0.0.[2..11]
+policyd-spf_time_limit = 3600
+
+# Which SMTP login owns which envelope sender (<data>/configs/mail/senders).
+smtpd_sender_login_maps = texthash:/etc/srv/mail/senders
+
+# --- Forwarding -------------------------------------------------------------
+virtual_alias_domains = blunderer.org lelong.xyz n.lelong.xyz rion.lelong.xyz libroxml.net libroxml.com
+# The postsrsd lookup lets bounces to SRS0=...@blunderer.org addresses pass the
+# "unknown recipient" check; they are then rewritten back to the sender.
+# dmarc_alias comes first: its one address is kept here (below), even if the
+# forwarding table has a catch-all for its domain.
+virtual_alias_maps =
+	texthash:/etc/postfix/dmarc_alias
+	texthash:/etc/srv/mail/virtual
+	socketmap:inet:127.0.0.1:10003:reverse
+
+# SRS: envelope addresses only, never headers (that would break DKIM).
+sender_canonical_maps = socketmap:inet:127.0.0.1:10003:forward
+sender_canonical_classes = envelope_sender
+recipient_canonical_maps = socketmap:inet:127.0.0.1:10003:reverse
+recipient_canonical_classes = envelope_recipient, header_recipient
+
+# --- Kept on this host: DMARC aggregate reports ------------------------------
+# The rua= address of blunderer.org (dmarc_alias) leads to a Maildir in the
+# mail-reports volume folder instead of Gmail: machine-readable, no use there.
+# dmarc.invalid is internal only (a reserved name, never in DNS). Each mail
+# host keeps the reports it received; srv hook mail prune-reports (cron,
+# daily) deletes those older than 90 days.
+virtual_mailbox_domains = dmarc.invalid
+virtual_mailbox_base = /var/mail/reports
+virtual_mailbox_maps = texthash:/etc/postfix/dmarc_mailbox
+# Not a login: only owns the Maildir (srv-postfix creates the folder for it).
+virtual_uid_maps = static:5000
+virtual_gid_maps = static:5000
+
+# Never re-encode an 8-bit body when forwarding (would break DKIM).
+disable_mime_output_conversion = yes
+
+# --- Milters: DKIM sign/verify, spam score (rspamd), then ARC verify/seal ------
+# With a milter down, mail is accepted as if it were not there (accept).
+milter_protocol = 6
+milter_default_action = accept
+smtpd_milters = inet:127.0.0.1:12301, inet:127.0.0.1:11332, inet:127.0.0.1:12302
+non_smtpd_milters = $smtpd_milters

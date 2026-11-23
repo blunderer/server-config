@@ -1,0 +1,38 @@
+[Unit]
+Description=Mail SMTP authentication daemon (saslauthd)
+
+[Container]
+ContainerName=srv-mail-saslauthd
+Pod=srv-mail.pod
+Image=localhost/srv/mail:${SRV_RELEASE}
+User=0:0
+GroupAdd=1000
+DropCapability=ALL
+AddCapability=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+PidsLimit=128
+Exec=saslauthd -a shadow -d -m /run/saslauthd -n 2
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_VOLUMES}/mail-saslauthd:/run/saslauthd
+Volume=${SRV_DATA}/users/postfix/passwd:/etc/passwd:ro
+Volume=${SRV_DATA}/users/postfix/shadow:/etc/shadow:ro
+Volume=${SRV_DATA}/users/postfix/group:/etc/group:ro
+HealthCmd=sh -c 'grep -qx saslauthd /proc/[0-9]*/comm 2>/dev/null && test -S /run/saslauthd/mux'
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=128m --log-opt=tag=saslauthd
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

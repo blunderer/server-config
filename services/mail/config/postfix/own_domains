@@ -1,0 +1,12 @@
+# Envelope senders refused from unauthenticated clients (check_sender_access).
+# The .domain lines cover subdomains (n.lelong.xyz...). Authenticated users and
+# bounces (empty sender) are not affected. Keep in sync with
+# virtual_alias_domains in main.cf.
+blunderer.org   REJECT Not authorized to send mail as this domain
+.blunderer.org  REJECT Not authorized to send mail as this domain
+lelong.xyz      REJECT Not authorized to send mail as this domain
+.lelong.xyz     REJECT Not authorized to send mail as this domain
+libroxml.net    REJECT Not authorized to send mail as this domain
+.libroxml.net   REJECT Not authorized to send mail as this domain
+libroxml.com    REJECT Not authorized to send mail as this domain
+.libroxml.com   REJECT Not authorized to send mail as this domain

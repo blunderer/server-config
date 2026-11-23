@@ -1,0 +1,4 @@
+# DMARC aggregate reports (rua= of blunderer.org): kept in a local Maildir,
+# not forwarded (main.cf, "Kept on this host"). Searched before the forwarding
+# table, so a catch-all there does not take this address.
+dmarc-reports@blunderer.org   reports@dmarc.invalid

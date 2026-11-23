@@ -1,0 +1,5 @@
+# Forwarding table, an example: the real one is <data>/configs/mail/virtual,
+# edited with `box mail config` (not in git: it holds private addresses).
+# <address> <destination>[, <destination>...]; @domain catches the rest.
+contact@blunderer.org   you@gmail.com
+team@lelong.xyz         you@gmail.com, someone@example.com

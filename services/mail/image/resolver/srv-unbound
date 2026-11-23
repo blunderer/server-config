@@ -1,0 +1,11 @@
+#!/bin/sh
+# Start unbound in the foreground with the configuration from the release.
+# The DNSSEC trust anchor is copied fresh from dns-root-data on every start
+# (unbound keeps it current while running, RFC 5011).
+set -eu
+conf=/etc/srv/unbound.conf
+install -d -o unbound -g unbound /var/lib/unbound
+cp /usr/share/dns/root.key /var/lib/unbound/root.key
+chown unbound:unbound /var/lib/unbound/root.key
+unbound-checkconf "$conf"
+exec unbound -d -p -c "$conf"

@@ -1,0 +1,38 @@
+[Unit]
+Description=Mail DKIM milter (OpenDKIM)
+Wants=srv-mail-resolver.service
+After=srv-mail-resolver.service
+
+[Container]
+ContainerName=srv-mail-opendkim
+Pod=srv-mail.pod
+Image=localhost/srv/mail:${SRV_RELEASE}
+# DKIM keys in <data>/keys/opendkim belong to uid 1000.
+User=1000:1000
+DropCapability=ALL
+NoNewPrivileges=true
+PidsLimit=128
+Exec=opendkim -f -x /etc/srv/opendkim/opendkim.conf
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_RELEASE_DIR}/config/opendkim:/etc/srv/opendkim:ro
+Volume=/run/systemd/journal/dev-log:/dev/log
+@opendkim_secrets@
+HealthCmd=nc -z -w 2 127.0.0.1 12301
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=128m --log-opt=tag=opendkim
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

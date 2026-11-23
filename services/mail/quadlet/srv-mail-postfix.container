@@ -1,0 +1,47 @@
+[Unit]
+Description=Mail transfer agent (Postfix)
+Wants=srv-mail-resolver.service srv-mail-saslauthd.service srv-mail-opendkim.service srv-mail-openarc.service srv-mail-rspamd.service srv-mail-postsrsd.service
+After=srv-mail-resolver.service srv-mail-saslauthd.service srv-mail-opendkim.service srv-mail-openarc.service srv-mail-rspamd.service srv-mail-postsrsd.service
+
+[Container]
+ContainerName=srv-mail-postfix
+Pod=srv-mail.pod
+Image=localhost/srv/mail:${SRV_RELEASE}
+User=0:0
+DropCapability=ALL
+AddCapability=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
+PidsLimit=512
+StopTimeout=60
+Exec=srv-postfix
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_RELEASE_DIR}/config/postfix:/etc/srv/postfix:ro
+Volume=${SRV_RELEASE_DIR}/config/policyd-spf.conf:/etc/srv/policyd-spf.conf:ro
+Volume=${SRV_DATA}/configs/mail:/etc/srv/mail:ro
+Volume=${SRV_VOLUMES}/mail-saslauthd:/run/saslauthd
+# Shared across releases: deferred mail is not lost across switches/rollbacks.
+Volume=${SRV_VOLUMES}/mail-spool:/var/spool/postfix
+# DMARC aggregate reports kept on this host (volumes_dir, not data_dir).
+Volume=${SRV_VOLUMES}/mail-reports:/var/mail/reports
+Secret=srv-ssl-cert,type=mount,target=/keys/ssl/blunderer.org/fullchain.crt,mode=0444,uid=0,gid=0
+Secret=srv-ssl-key,type=mount,target=/keys/ssl/blunderer.org/blunderer.org.key,mode=0400,uid=0,gid=0
+HealthCmd=postfix status
+HealthTimeout=10s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=512m --log-opt=tag=postfix
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+TimeoutStopSec=75
+OOMScoreAdjust=-200
+
+[Install]
+WantedBy=default.target

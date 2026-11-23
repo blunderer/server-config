@@ -1,0 +1,8 @@
+# Senders table, an example: the real one is <data>/configs/mail/senders,
+# edited with `box mail config` (after the forwarding table).
+# <address|@domain> <login>[, <login>...]: the SMTP logins allowed to send
+# with that envelope sender. Unlisted addresses are refused to logged-in
+# clients (foreign domains included).
+contact@blunderer.org   tristan
+@lelong.xyz             tristan
+alerts@blunderer.org    alerts

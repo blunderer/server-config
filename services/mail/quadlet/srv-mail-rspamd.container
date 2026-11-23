@@ -1,0 +1,36 @@
+[Unit]
+Description=Mail spam filter (Rspamd)
+Wants=srv-mail-resolver.service
+After=srv-mail-resolver.service
+
+[Container]
+ContainerName=srv-mail-rspamd
+Pod=srv-mail.pod
+Image=localhost/srv/mail:${SRV_RELEASE}
+User=0:0
+DropCapability=ALL
+AddCapability=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+PidsLimit=256
+Exec=rspamd -f -u _rspamd -g _rspamd
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_RELEASE_DIR}/config/rspamd:/etc/rspamd/local.d:ro
+HealthCmd=rspamc -h 127.0.0.1:11334 stat >/dev/null
+HealthTimeout=10s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=512m --log-opt=tag=rspamd
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

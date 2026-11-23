@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Delete the DMARC reports kept on this host (mail-reports) that are older
+# than 90 days (cron, daily: srv hook mail prune-reports).
+set -euo pipefail
+# shellcheck source=lib/runtime.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/runtime.sh"
+rt=$(rt_service_runtime mail 2>/dev/null || true)
+[[ -n $rt || -n ${SRV_CURRENT_PROJECT:-} ]] || { echo "mail is not deployed with srv here: nothing to prune"; exit 0; }
+cid=$(rt_find_container mail postfix srv-mail-postfix)
+[[ -n $cid ]] || { echo "postfix is not running" >&2; exit 1; }
+n=$(rt_exec -- "$cid" sh -c 'find /var/mail/reports -type f \( -path "*/new/*" -o -path "*/cur/*" \) -mtime +90 -print -delete | wc -l')
+echo "deleted $n report(s) older than 90 days"

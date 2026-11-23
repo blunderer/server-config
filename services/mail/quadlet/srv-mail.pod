@@ -1,0 +1,18 @@
+[Unit]
+Description=Mail stack pod (postfix, SASL, DKIM, ARC, SRS, rspamd, unbound)
+Wants=network-online.target
+After=network-online.target
+
+[Pod]
+PodName=srv-mail
+Network=pasta
+PodmanArgs=--hostname=@server_name@
+# Recursive resolver in this pod (unbound), so blocklists see this host's IP.
+DNS=127.0.0.1
+PublishPort=25:25
+PublishPort=465:465
+PublishPort=587:587
+UserNS=keep-id
+
+[Install]
+WantedBy=default.target
