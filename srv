@@ -1,0 +1,1434 @@
+#!/usr/bin/env bash
+#
+# srv - manage the blunderer.org services as versioned releases.
+#
+# A *service* is a directory in services/<name>/ (quadlet/ units, config
+# templates, optional images and hooks). Deploying it creates a *release*:
+# a frozen copy in $SRV_STATE/<name>/<release>/ with the templates rendered
+# from this host's env file, running as rootless Podman Quadlets (while
+# still supporting existing Docker Compose releases during migration).
+#
+#   srv deploy web     create a new release, stop the current one, start the new one
+#   srv rollback web   swap back to the previous release (instant, nothing rebuilt)
+#   srv commit web     delete the previous release's state and prune old images
+#
+# Run `srv help` for every command. Documentation: docs/ in this repository.
+
+set -Eeuo pipefail
+shopt -s nullglob
+
+SRV_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+SRV_HOST_ENV=${SRV_HOST_ENV:-/etc/srv/host.env}
+SRV_STATE=${SRV_STATE:-/srv/releases}
+SRV_KEEP=${SRV_KEEP:-3}
+SRV_YES=${SRV_YES:-0}
+SRV_VERBOSE=${SRV_VERBOSE:-0}
+SRV_BUILD_JOBS=${SRV_BUILD_JOBS:-4}
+
+# shellcheck source=lib/runtime.sh
+. "$SRV_ROOT/lib/runtime.sh"
+
+declare -A HOST=()   # values from the host env file (+ derived ones)
+declare -A META=()   # values from services/<svc>/service.env
+
+# ---------------------------------------------------------------- output
+
+if [[ -t 1 ]]; then
+	C_RED=$'\e[31m' C_GRN=$'\e[32m' C_YLW=$'\e[33m' C_BLD=$'\e[1m' C_OFF=$'\e[0m'
+else
+	C_RED='' C_GRN='' C_YLW='' C_BLD='' C_OFF=''
+fi
+
+info() { printf '%s==>%s %s\n' "$C_BLD" "$C_OFF" "$*"; }
+ok()   { printf '%s ok%s %s\n' "$C_GRN" "$C_OFF" "$*"; }
+warn() { printf '%swarn%s %s\n' "$C_YLW" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+need_root() { [[ $(id -u) == 0 ]] || die "run as root: sudo ${0##*/} ${SRV_ARGS:-}"; }
+
+# confirm "question" -> 0 if yes. Defaults to no; SRV_YES=1 or -y answers yes.
+confirm() {
+	[[ $SRV_YES == 1 ]] && return 0
+	[[ -t 0 ]] || die "'$1' needs confirmation: run interactively or pass -y"
+	local answer
+	read -r -p "$1 [y/N] " answer
+	[[ $answer == [yY]* ]]
+}
+
+# --------------------------------------------------------------- env files
+
+# parse_env FILE ARRAY_NAME: read KEY=value lines (shell-like, no evaluation).
+parse_env() {
+	local file=$1 line key value n=0
+	local -n _dest=$2
+	[[ -r $file ]] || die "cannot read $file"
+	while IFS= read -r line || [[ -n $line ]]; do
+		n=$((n + 1))
+		line=${line#"${line%%[![:space:]]*}"}             # trim leading space
+		[[ -z $line || $line == \#* ]] && continue
+		[[ $line =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] ||
+			die "$file:$n: expected KEY=value"
+		key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+		value=${value%"${value##*[![:space:]]}"}          # trim trailing space
+		if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
+			value=${BASH_REMATCH[1]}
+		fi
+		_dest["$key"]=$value
+	done <"$file"
+}
+
+# The host values: the inventory shared by all hosts (hosts.env, next to the
+# host file unless SRV_HOSTS_ENV says otherwise), then this host's file, which
+# may override anything. Roles are derived from the inventory below.
+load_host() {
+	[[ ${#HOST[@]} -gt 0 ]] && return 0
+	[[ -e $SRV_HOST_ENV ]] || die "no host env file at $SRV_HOST_ENV (see examples/example.env and docs/host-setup.md)"
+	local hosts_env=${SRV_HOSTS_ENV:-$(dirname "$(readlink -f "$SRV_HOST_ENV")")/hosts.env}
+	[[ -e $hosts_env ]] || die "no inventory at $hosts_env (see examples/example-hosts.env)"
+	parse_env "$hosts_env" HOST
+	parse_env "$SRV_HOST_ENV" HOST
+	HOST[hosts_file]=$(readlink -f "$hosts_env")
+	local k h
+	for k in host hosts leader web; do
+		[[ -n ${HOST[$k]:-} ]] || die "'$k' is required (host file $SRV_HOST_ENV or inventory $hosts_env)"
+	done
+	HOST[services]=${HOST[services]:-}
+	if [[ " ${HOST[services]} " == *" autoheal "* ]]; then
+		warn "service 'autoheal' is retired under Podman (HealthOnFailure=restart replaces it); ignoring — remove it from $SRV_HOST_ENV"
+		local _svcs=() _s
+		for _s in ${HOST[services]}; do
+			[[ $_s == autoheal ]] || _svcs+=("$_s")
+		done
+		HOST[services]=${_svcs[*]}
+	fi
+	for k in leader web; do
+		[[ " ${HOST[hosts]} " == *" ${HOST[$k]} "* ]] ||
+			die "$k=${HOST[$k]} is not in hosts=\"${HOST[hosts]}\" ($hosts_env)"
+	done
+	if [[ " ${HOST[hosts]} " == *" ${HOST[host]} "* ]]; then
+		HOST[in_inventory]=yes
+	else
+		HOST[in_inventory]=no
+		[[ -z ${HOST[services]} ]] ||
+			die "host=${HOST[host]} is not in hosts=\"${HOST[hosts]}\" ($hosts_env): it cannot run services"
+	fi
+	[[ ${HOST[host]} =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] ||
+		die "host='${HOST[host]}': expected a single lowercase DNS label"
+	for h in ${HOST[hosts]}; do
+		[[ $h =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] ||
+			die "hosts: '$h': expected a single lowercase DNS label"
+		[[ -n ${HOST[${h}_ip]:-} ]] || die "${h}_ip is missing in $hosts_env"
+	done
+	HOST[data_dir]=${HOST[data_dir]:-/home/data}
+	HOST[volumes_dir]=${HOST[volumes_dir]:-/home/volumes}
+	HOST[podman_storage_dir]=${HOST[podman_storage_dir]:-/home/podman}
+	# The Unix account the containers and data files belong to (uid 1000).
+	HOST[unix_role]=${HOST[unix_role]:-${SRV_DEFAULT_UNIX_ROLE:-blunderer}}
+	# Interactive admin account (sudo + personal SSH keys). Defaults to unix_role
+	# until separated (e.g. unix_role=srv, admin_role=blunderer).
+	HOST[admin_role]=${HOST[admin_role]:-${HOST[unix_role]}}
+	HOST[tz]=${HOST[tz]:-Europe/Paris}
+	HOST[domain]=${HOST[domain]:-blunderer.org}
+	# Extra SPF mechanisms (" ip4:... ip6:..."), optional: none by default.
+	HOST[spf_extra]=${HOST[spf_extra]:-}
+	# Minecraft (services/minecraft): settings with defaults.
+	HOST[minecraft_name]=${HOST[minecraft_name]:-${HOST[domain]}}
+	HOST[minecraft_gamemode]=${HOST[minecraft_gamemode]:-survival}
+	HOST[minecraft_difficulty]=${HOST[minecraft_difficulty]:-easy}
+	HOST[minecraft_max_players]=${HOST[minecraft_max_players]:-10}
+	# The onion service, optional: without onion_name the onion service
+	# cannot be deployed (NEEDS in its service.env) and the websites do not
+	# advertise it (Onion-Location).
+	HOST[onion_name]=${HOST[onion_name]:-}
+	if [[ -n ${HOST[onion_name]} ]]; then
+		HOST[onion_location]="add_header Onion-Location http://${HOST[onion_name]}.onion\$request_uri;"
+	else
+		HOST[onion_location]="# no Onion-Location: onion_name is not set"
+	fi
+	HOST[zone_serial]=$(date +%s)
+	derive_roles
+}
+
+# derive_roles: everything that depends on which host is which.
+derive_roles() {
+	local self=${HOST[host]} leader=${HOST[leader]} h n ip6 records='' slaves='' remotes=''
+	if [[ ${HOST[in_inventory]} == yes ]]; then
+		HOST[host_ip]=${HOST[${self}_ip]}
+		HOST[is_leader]=$([[ $self == "$leader" ]] && echo yes || echo no)
+	else
+		HOST[host_ip]=''
+		HOST[is_leader]=no
+	fi
+	# DNS: the leader is the master, every other host a slave.
+	HOST[dns_role]=${HOST[dns_role]:-$([[ ${HOST[is_leader]} == yes ]] && echo master || echo slave)}
+	HOST[dns_master]=${HOST[${leader}_ip]}
+	# Websites: the host named by web= (box migrate changes it).
+	HOST[web_ip]=${HOST[${HOST[web]}_ip]}
+	local n fam plain
+	for h in ${HOST[hosts]}; do
+		ip6=${HOST[${h}_ip6]:-}
+		# Machine records for the blunderer.org zone: <host>, *.<host> -> <host>,
+		# and its names (ns0, mail0...): A, plus AAAA when the inventory has
+		# <host>_ip6. The SPF "mx" mechanism then covers the mail hosts' IPv6
+		# addresses too. A name ending in :4 gets only the A record, :6 only the
+		# AAAA (e.g. ns6:6, a name server reached over IPv6 only, for its glue
+		# record).
+		plain=''
+		for n in "$h" ${HOST[${h}_names]:-}; do
+			fam=46
+			[[ $n == *:* ]] && { fam=${n##*:}; n=${n%:*}; }
+			[[ $fam =~ ^(4|6|46)$ ]] || die "${h}_names: '$n:$fam': the suffix is :4 or :6"
+			[[ $fam == 6 && -z $ip6 ]] && die "${h}_names: $n:6, but ${h}_ip6 is not set"
+			[[ $fam == *4* ]] && records+="$n"$'\t\t\t\tIN A\t\t'"${HOST[${h}_ip]}"$'\n'
+			[[ $fam == *6* && -n $ip6 ]] && records+="$n"$'\t\t\t\tIN AAAA\t\t'"$ip6"$'\n'
+			[[ $n == "$h" ]] || plain+="$n "
+		done
+		records+="*.$h"$'\t\t\t\tIN CNAME\t'"$h"$'\n'
+		# Without the suffixes for everything else (mail names, mx=, smtp).
+		HOST[${h}_names]=${plain% }
+		[[ $h == "$leader" ]] && continue
+		slaves+="${HOST[${h}_ip]}; "
+		[[ -n $ip6 ]] && slaves+="$ip6; "
+		remotes+="root@${HOST[${h}_ip]} "
+	done
+	HOST[machine_records]=${records%$'\n'}
+	# The name servers of every zone (NS records, also the acme. and smtp.
+	# delegations): ns= in the inventory, names of the hosts above. They must
+	# match the glue records at the registrar.
+	HOST[ns]=${HOST[ns]:-ns0 ns1}
+	local all_ns=" " ns_lines='' acme_lines='' smtp_lines=''
+	for h in ${HOST[hosts]}; do all_ns+="$h ${HOST[${h}_names]:-} "; done
+	for n in ${HOST[ns]}; do
+		[[ $all_ns == *" $n "* ]] || die "ns: '$n' is neither a host nor one of their names (inventory)"
+		ns_lines+=$'@\t\t\t\tIN NS\t\t'"$n.${HOST[domain]}."$'\n'
+		acme_lines+=$'acme\t\t\t\tIN NS\t\t'"$n.${HOST[domain]}."$'\n'
+		smtp_lines+=$'smtp\t\t\t\tIN NS\t\t'"$n.${HOST[domain]}."$'\n'
+	done
+	HOST[ns_records]=${ns_lines%$'\n'}
+	HOST[acme_ns_records]=${acme_lines%$'\n'}
+	HOST[smtp_ns_records]=${smtp_lines%$'\n'}
+	# smtp.blunderer.org (submission for mail clients): the mail hosts listed
+	# in smtp= (inventory); the initial records of its dynamic zone, then box
+	# smtp-health keeps the ones that work (STARTTLS, login).
+	HOST[smtp]=${HOST[smtp]:-}
+	for h in ${HOST[hosts]}; do
+		[[ " ${HOST[${h}_names]:-} " != *" smtp "* ]] ||
+			die "${h}_names lists smtp: smtp.blunderer.org is its own zone, kept by smtp= in the inventory (remove it from ${h}_names)"
+	done
+	records=''
+	for h in ${HOST[smtp]}; do
+		records+=$'@\tIN\tA\t'"${HOST[${h}_ip]:?smtp=: $h is not a host of the inventory}"$'\n'
+		[[ -z ${HOST[${h}_ip6]:-} ]] || records+=$'@\tIN\tAAAA\t'"${HOST[${h}_ip6]}"$'\n'
+	done
+	HOST[smtp_records]=${records%$'\n'}
+	# Let's Encrypt DNS-01 CNAMEs for *.<host>.<domain> (into acme.blunderer.org)
+	# and <other_host>.<this_host>.<domain> names excluded in nginx.
+	local host_acme='' host_excluded=''
+	for h in ${HOST[hosts]}; do
+		host_acme+="_acme-challenge.$h"$'\t\tIN CNAME\t'"$h.${HOST[domain]}.acme.blunderer.org."$'\n'
+		host_excluded+="$h.${HOST[host]}.${HOST[domain]} "
+	done
+	HOST[host_acme_records]=${host_acme%$'\n'}
+	HOST[host_excluded_names]=${host_excluded% }
+	HOST[dns_slaves_list]=$slaves
+	HOST[dns_slaves]=$(xargs <<<"${slaves//;/}")
+	local slave_servers=''
+	for n in ${HOST[dns_slaves]}; do
+		slave_servers+="server $n { keys { xfer-tsig; }; };"$'\n'
+	done
+	HOST[dns_slave_servers]=${slave_servers:-// (no secondaries)}
+	HOST[dns_slave_servers]=${HOST[dns_slave_servers]%$'\n'}
+	# Its zone exists only with smtp= set. Every name server is a primary
+	# for it, not a slave of the leader: each host's box smtp-health keeps its
+	# own copy, so the name still drops a dead host when the leader is the
+	# one that died. No transfers: the copies only agree because every host
+	# checks the same mail hosts.
+	if [[ -n ${HOST[smtp]} ]]; then
+		HOST[smtp_delegation]=${HOST[smtp_ns_records]}
+		HOST[smtp_zone]="include \"/etc/srv/smtp-tsig.key\";
+zone \"smtp.blunderer.org\" {
+	type primary;
+	file \"/var/lib/bind/smtp.blunderer.org.zone\";
+	// Only this host's box smtp-health key, only that name's addresses (and
+	// its NS records, for the dns post-switch hook).
+	update-policy { grant smtp-update name smtp.blunderer.org. A AAAA NS; };
+	allow-transfer { none; };
+};"
+	else
+		HOST[smtp_delegation]="; (smtp= unset)"
+		HOST[smtp_zone]="// (smtp= unset)"
+	fi
+	# The agy service's sandboxes (agy_instances): one container each, with
+	# its own volumes, sign-in and hostname (its name on the Remote Control
+	# dashboard). The instance "agy" keeps the first layout's names.
+	HOST[agy_instances]=${HOST[agy_instances]:-agy}
+	HOST[agy_mem]=${HOST[agy_mem]:-2g}
+	# Legacy pre-volumes_dir overlay roots, kept so srv deploy / srv commit and
+	# box check/audit can migrate and clean up existing overlays.
+	HOST[agy_share_dir]=${HOST[agy_share_dir]:-/home/srv-agy}
+	local inst vh vw vs agy_names=''
+	HOST[jellyfin_overlay_dir]=${HOST[jellyfin_overlay_dir]:-/home/srv-jellyfin}
+	for inst in ${HOST[agy_instances]}; do
+		[[ $inst =~ ^[a-z][a-z0-9-]{0,30}$ ]] || die "agy_instances: '$inst': lowercase letters, digits and -"
+		if [[ $inst == agy ]]; then vh=agy-home vw=agy-work vs=agy-shares
+		else vh=agy-$inst-home vw=agy-$inst-work vs=agy-$inst-shares; fi
+		agy_names+="$vh $vw $vs "
+	done
+	HOST[agy_volume_names]=${agy_names% }
+
+	# Data replication and certificates: from the leader to the others.
+	if [[ ${HOST[is_leader]} == yes ]]; then
+		HOST[remote_hosts]=${HOST[remote_hosts]:-${remotes% }}
+	else
+		HOST[remote_hosts]=${HOST[remote_hosts]:-}
+	fi
+	# MX records, in every zone: mx= in the inventory lists the targets in
+	# order of preference (priority 100, 200...). Each is a host or one of its
+	# names; the default keeps the historical mail0/mail1.
+	local mx all_names='' i=0 owner
+	HOST[mx]=${HOST[mx]:-mail0 mail1}
+	for h in ${HOST[hosts]}; do all_names+=" $h ${HOST[${h}_names]:-} "; done
+	HOST[mx_first]='' HOST[mx_rest]=''
+	for mx in ${HOST[mx]}; do
+		[[ $all_names == *" $mx "* ]] ||
+			die "mx: '$mx' is neither a host nor one of their names (inventory)"
+		i=$((i + 1))
+		if [[ $i == 1 ]]; then
+			HOST[mx_first]="$((i * 100))"$'\t'"$mx.${HOST[domain]}."
+		else
+			# Starts with whitespace: same owner as the line above.
+			HOST[mx_rest]+=$'\t\t\tIN MX\t'"$((i * 100))"$'\t'"$mx.${HOST[domain]}."$'\n'
+		fi
+	done
+	HOST[mx_rest]=${HOST[mx_rest]%$'\n'}
+	# Mail identity (HELO, reverse name): the name this host has in mx=,
+	# else its first mailN name, else <host>.<domain>.
+	if [[ -z ${HOST[server_name]:-} ]]; then
+		owner=''
+		for mx in ${HOST[mx]}; do
+			[[ " $self ${HOST[${self}_names]:-} " == *" $mx "* ]] && { owner=$mx; break; }
+		done
+		[[ -n $owner ]] || owner=$(tr ' ' '\n' <<<"${HOST[${self}_names]:-}" | grep -m1 '^mail' || true)
+		HOST[server_name]=${owner:-$self}.${HOST[domain]}
+	fi
+	# mail_relay: a mail host name the certificate covers, for clients on this
+	# host (alerts): this host's own mailN name when it runs mail, otherwise
+	# the leader's (vega.blunderer.org is not in the certificate).
+	n=''
+	[[ " ${HOST[services]:-} " == *" mail "* ]] &&
+		n=$(tr ' ' '\n' <<<"${HOST[${self}_names]:-}" | grep -m1 '^mail' || true)
+	[[ -n $n ]] || n=$(tr ' ' '\n' <<<"${HOST[${leader}_names]:-}" | grep -m1 '^mail' || true)
+	HOST[mail_relay]=${n:+$n.${HOST[domain]}}
+	HOST[mail_relay]=${HOST[mail_relay]:-${HOST[server_name]}}
+	# Outgoing mail over IPv6 only when this host's IPv6 address is in the
+	# inventory (so its names have AAAA records); otherwise IPv4 first, since
+	# receivers reject an IPv6 source without matching reverse and forward names.
+	HOST[smtp_address_preference]=${HOST[smtp_address_preference]:-$([[ -n ${HOST[${self}_ip6]:-} ]] && echo any || echo ipv4)}
+
+	# Owner (uid:gid) of what srv's hooks, box and ssl/renew.sh create in
+	# the data folder: data_owner=, else the data folder's own owner, so files
+	# created by root (sudo) still belong to blunderer (lib/data-owner.sh).
+	HOST[data_owner]=${HOST[data_owner]:-$(stat -c %u:%g "${HOST[data_dir]}" 2>/dev/null || true)}
+
+	# rspamd's reject score (spam_reject): "null" = tag only, the default.
+	HOST[rspamd_reject]=${HOST[spam_reject]:-null}
+	[[ ${HOST[rspamd_reject]} == null || ${HOST[rspamd_reject]} =~ ^[0-9]+(\.[0-9]+)?$ ]] ||
+		die "spam_reject=${HOST[rspamd_reject]}: a score (e.g. 15), or unset to only tag"
+
+	# Per-stack external Docker networks (ensure_network), and the mail
+	# resolver's fixed address on srv-mail (.253 of a /24 subnet: far from
+	# the low addresses Docker hands out). 172.30.0.0/24 and fd5a:7372:7600::/64
+	# stay retired so pre-split `srv` releases can coexist until committed.
+	HOST[srv_web_subnet]=${HOST[srv_web_subnet]:-172.30.1.0/24}
+	HOST[srv_web_subnet6]=${HOST[srv_web_subnet6]:-fd5a:7372:7601::/64}
+	HOST[srv_dns_subnet]=${HOST[srv_dns_subnet]:-172.30.2.0/24}
+	HOST[srv_dns_subnet6]=${HOST[srv_dns_subnet6]:-fd5a:7372:7602::/64}
+	HOST[srv_minecraft_subnet]=${HOST[srv_minecraft_subnet]:-172.30.3.0/24}
+	HOST[srv_minecraft_subnet6]=${HOST[srv_minecraft_subnet6]:-fd5a:7372:7603::/64}
+	HOST[srv_vpn_subnet]=${HOST[srv_vpn_subnet]:-172.30.4.0/24}
+	HOST[srv_vpn_subnet6]=${HOST[srv_vpn_subnet6]:-fd5a:7372:7604::/64}
+	HOST[srv_mail_subnet]=${HOST[srv_mail_subnet]:-${HOST[srv_subnet]:-172.30.5.0/24}}
+	HOST[srv_mail_subnet6]=${HOST[srv_mail_subnet6]:-${HOST[srv_subnet6]:-fd5a:7372:7605::/64}}
+	if [[ -z ${HOST[mail_resolver_ip]:-} ]]; then
+		[[ ${HOST[srv_mail_subnet]} =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.0/24$ ]] ||
+			die "srv_mail_subnet=${HOST[srv_mail_subnet]} is not a /24: set mail_resolver_ip to an address in it"
+		HOST[mail_resolver_ip]=${BASH_REMATCH[1]}.253
+	fi
+
+	# Rootless Podman Quadlet networks (10.89.1.0/24 & fd5a:7372:7611::/64 for web,
+	# internal 10.89.2.0/24 for db) coexist safely alongside legacy Docker bridges.
+	HOST[podman_web_subnet]=${HOST[podman_web_subnet]:-10.89.1.0/24}
+	HOST[podman_web_gw]=${HOST[podman_web_gw]:-${HOST[podman_web_subnet]%.*}.1}
+	HOST[podman_web_subnet6]=${HOST[podman_web_subnet6]:-fd5a:7372:7611::/64}
+	HOST[podman_web_gw6]=${HOST[podman_web_gw6]:-${HOST[podman_web_subnet6]%/*}1}
+	HOST[podman_db_subnet]=${HOST[podman_db_subnet]:-10.89.2.0/24}
+	HOST[podman_db_gw]=${HOST[podman_db_gw]:-${HOST[podman_db_subnet]%.*}.1}
+	HOST[podman_db_ip]=${HOST[podman_db_ip]:-${HOST[podman_db_subnet]%.*}.2}
+}
+
+load_meta() {
+	local svc=$1 sdir="$SRV_ROOT/services/$1"
+	META=()
+	[[ -d $sdir/quadlet ]] || die "unknown service '$svc' (see: srv services)"
+	if [[ -f $sdir/service.env ]]; then
+		parse_env "$sdir/service.env" META
+	fi
+	META[DEPENDS]=${META[DEPENDS]:-}
+	META[LEGACY]=${META[LEGACY]:-}
+	META[VOLUMES]=${META[VOLUMES]:-}
+	META[NETWORKS]=${META[NETWORKS]:-}
+	META[IMAGES]=${META[IMAGES]:-}
+	META[HEALTH_TIMEOUT]=${META[HEALTH_TIMEOUT]:-180}
+	META[RELOAD]=${META[RELOAD]:-}
+	# Host values the service cannot run without (optional ones elsewhere).
+	META[NEEDS]=${META[NEEDS]:-}
+}
+
+# missing_needs SVC: the NEEDS of the loaded service that the host leaves
+# empty, space-separated (none: empty output).
+missing_needs() {
+	local v out=''
+	for v in ${META[NEEDS]}; do
+		[[ -n ${HOST[$v]:-} ]] || out+="$v "
+	done
+	echo "${out% }"
+}
+
+all_services() {
+	local d
+	for d in "$SRV_ROOT"/services/*/; do
+		[[ -d ${d}quadlet ]] || continue
+		basename "$d"
+	done | sort
+}
+
+# enabled_services: this host's services, dependencies first.
+enabled_services() {
+	load_host
+	# shellcheck disable=SC2086 # space-separated list
+	order_services ${HOST[services]}
+}
+
+order_services() {
+	(($# > 0)) || return 0
+	local -A seen=() wanted=()
+	local -a ordered=()
+	local s
+	for s in "$@"; do wanted[$s]=1; done
+	visit() {
+		local svc=$1 dep
+		[[ -n ${seen[$svc]:-} ]] && return 0
+		seen[$svc]=1
+		load_meta "$svc"
+		for dep in ${META[DEPENDS]}; do
+			[[ -n ${wanted[$dep]:-} ]] && visit "$dep"
+		done
+		ordered+=("$svc")
+	}
+	for s in "$@"; do visit "$s"; done
+	printf '%s\n' "${ordered[@]}"
+}
+
+# ---------------------------------------------------------------- rendering
+
+# render_file FILE: replace @name@ with host values in place; unknown -> error.
+render_file() {
+	local file=$1 k
+	grep -Iq . "$file" 2>/dev/null || return 0   # skip empty/binary files
+	local -a envs=()
+	for k in "${!HOST[@]}"; do envs+=("SRV_V_$k=${HOST[$k]}"); done
+	# shellcheck disable=SC2016 # perl code, not shell
+	env "${envs[@]}" perl -i -pe '
+		s{\@([a-z][a-z0-9_]*)\@}{
+			exists $ENV{"SRV_V_$1"} ? $ENV{"SRV_V_$1"}
+			: die "undefined template variable \@$1\@ in $ARGV line $.\n"
+		}ge' "$file" || die "cannot render $file"
+}
+
+# _dkim_secret_lines KIND FILE: extract /keys/<folder>/<sel>.private paths from
+# rendered KeyTable or openarc.conf and print deduplicated Podman Secret= lines.
+_dkim_secret_lines() {
+	local kind=$1 file=$2
+	[[ -f $file ]] || return 0
+	python3 -c '
+import os, re, sys
+kind, path = sys.argv[1], sys.argv[2]
+seen = set()
+with open(path, encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        kpath = ""
+        if kind == "opendkim":
+            parts = line.split()
+            if len(parts) >= 2:
+                segs = parts[1].split(":", 2)
+                if len(segs) == 3 and segs[2].startswith("/keys/"):
+                    kpath = segs[2]
+        else:
+            m = re.match(r"^KeyFile\s+(/keys/\S+)", line)
+            if m:
+                kpath = m.group(1)
+        if not kpath or kpath in seen:
+            continue
+        seen.add(kpath)
+        rel = kpath[len("/keys/"):]
+        folder, base = os.path.split(rel)
+        sel = base[:-8] if base.endswith(".private") else base
+        print(f"Secret=srv-dkim-{folder}--{sel},type=mount,target={kpath},mode=0400,uid=1000,gid=1000")
+' "$kind" "$file"
+}
+
+# _expand_quadlet_vars FILE SERVICE RELEASE RELEASE_DIR: statically expand ${SRV_*}
+# tokens inside a Quadlet file (Quadlet itself does not interpolate host .env files).
+_expand_quadlet_vars() {
+	local file=$1 svc=$2 rel=$3 rel_dir=$4
+	# shellcheck disable=SC2016 # Python literal keys
+	python3 -c '
+import sys
+path, svc, rel, rel_dir, data, vols, tz = sys.argv[1:8]
+rep = {
+    "${SRV_SERVICE}": svc,
+    "${SRV_RELEASE}": rel,
+    "${SRV_RELEASE_DIR}": rel_dir,
+    "${SRV_DATA}": data,
+    "${SRV_VOLUMES}": vols,
+    "${SRV_TZ}": tz,
+}
+with open(path, encoding="utf-8") as fh:
+    txt = fh.read()
+for k, v in rep.items():
+    txt = txt.replace(k, v)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(txt)
+' "$file" "$svc" "$rel" "$rel_dir" "${HOST[data_dir]}" "${HOST[volumes_dir]}" "${HOST[tz]}"
+}
+
+# _expand_agy_quadlets QUADLET_DIR: instantiate agy.container.tmpl for each agy_instances entry.
+_expand_agy_quadlets() {
+	local qdir=$1 tmpl="$1/agy.container.tmpl" inst svc ctr hname hvol wvol svol ltag out
+	[[ -f $tmpl ]] || return 0
+	for inst in ${HOST[agy_instances]:-agy}; do
+		if [[ $inst == agy ]]; then
+			out="$qdir/srv-agy.container"
+			svc=agy ctr=srv-agy hname=agy
+			hvol=agy-home wvol=agy-work svol=agy-shares ltag=srv-agy
+		else
+			out="$qdir/srv-agy-$inst.container"
+			svc="agy-$inst" ctr="srv-agy-$inst" hname="agy-$inst"
+			hvol="agy-$inst-home" wvol="agy-$inst-work" svol="agy-$inst-shares" ltag="srv-agy-$inst"
+		fi
+		cp "$tmpl" "$out"
+		python3 -c '
+import sys
+p, svc, ctr, hname, hvol, wvol, svol, ltag = sys.argv[1:9]
+with open(p, encoding="utf-8") as fh:
+    s = fh.read()
+for k, v in (
+    ("@svc@", svc), ("@container@", ctr), ("@hostname@", hname),
+    ("@home_vol@", hvol), ("@work_vol@", wvol), ("@shares_vol@", svol),
+    ("@log_tag@", ltag),
+):
+    s = s.replace(k, v)
+with open(p, "w", encoding="utf-8") as fh:
+    fh.write(s)
+' "$out" "$svc" "$ctr" "$hname" "$hvol" "$wvol" "$svol" "$ltag"
+	done
+	rm -f "$tmpl"
+}
+
+# write_quadlet_networks DIR: write srv-web.network and srv-db.network into DIR.
+write_quadlet_networks() {
+	local dir=$1
+	mkdir -p "$dir"
+	cat >"$dir/srv-web.network" <<-EOF
+		[Unit]
+		Description=Web public network (Podman Quadlet)
+
+		[Network]
+		NetworkName=srv-web
+		Subnet=${HOST[podman_web_subnet]}
+		Gateway=${HOST[podman_web_gw]}
+		IPv6=true
+		Subnet=${HOST[podman_web_subnet6]}
+		Gateway=${HOST[podman_web_gw6]}
+	EOF
+	cat >"$dir/srv-db.network" <<-EOF
+		[Unit]
+		Description=Database internal network (Podman Quadlet)
+
+		[Network]
+		NetworkName=srv-db
+		Subnet=${HOST[podman_db_subnet]}
+		Gateway=${HOST[podman_db_gw]}
+		Internal=true
+	EOF
+}
+
+# validate_quadlets DIR: static + podman-system-generator validation of DIR/quadlet.
+validate_quadlets() {
+	local dir=$1 qdir="$1/quadlet" gen='' g tmp
+	[[ -d $qdir ]] || { warn "missing $qdir"; return 1; }
+	# shellcheck disable=SC2016 # Python string literal
+	python3 -c '
+import glob, os, re, sys
+qdir = sys.argv[1]
+tmpls = glob.glob(os.path.join(qdir, "*.tmpl"))
+if tmpls:
+    sys.exit(f"unexpanded template(s): {tmpls}")
+units = sorted(
+    f for f in glob.glob(os.path.join(qdir, "*"))
+    if os.path.isfile(f) and f.endswith((".pod", ".container", ".network"))
+)
+ctrs = [f for f in units if f.endswith(".container")]
+pods = {os.path.basename(f) for f in units if f.endswith(".pod")}
+if not ctrs:
+    sys.exit(f"no .container units in {qdir}")
+for path in units:
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    raw = "\n".join(lines)
+    m = re.search(r"@[a-z][a-z0-9_]*@", raw)
+    if m:
+        sys.exit(f"{path}: unexpanded placeholder {m.group(0)}")
+    if "${SRV_" in raw:
+        sys.exit(f"{path}: unexpanded ${{SRV_*}} variable")
+    sec = None
+    data = {}
+    for ln_no, raw_ln in enumerate(lines, 1):
+        ln = raw_ln.strip()
+        if not ln or ln.startswith(("#", ";")):
+            continue
+        if ln.startswith("[") and ln.endswith("]"):
+            sec = ln[1:-1]
+            data.setdefault(sec, [])
+            continue
+        if "=" not in ln or sec is None:
+            sys.exit(f"{path}:{ln_no}: invalid INI line: {raw_ln}")
+        k, v = ln.split("=", 1)
+        data[sec].append((k.strip(), v.strip()))
+    if path.endswith(".pod"):
+        p = data.get("Pod")
+        if p is None:
+            sys.exit(f"{path}: missing [Pod] section")
+        pdict = {}
+        for k, v in p:
+            pdict.setdefault(k, []).append(v)
+        if not pdict.get("PodName") or not pdict["PodName"][0]:
+            sys.exit(f"{path}: missing PodName= in [Pod]")
+        if "HostName" in pdict:
+            sys.exit(f"{path}: HostName= in [Pod] requires Podman >= 5.5; use PodmanArgs=--hostname=...")
+    if path.endswith(".container"):
+        c = data.get("Container")
+        if c is None:
+            sys.exit(f"{path}: missing [Container] section")
+        cdict = {}
+        for k, v in c:
+            cdict.setdefault(k, []).append(v)
+        for req in ("ContainerName", "Image"):
+            if not cdict.get(req) or not cdict[req][0]:
+                sys.exit(f"{path}: missing {req}= in [Container]")
+        if "Memory" in cdict:
+            sys.exit(f"{path}: Memory= in [Container] requires Podman >= 5.5; use PodmanArgs=--memory=...")
+        if "Pod" in cdict:
+            podfile = cdict["Pod"][0]
+            if podfile not in pods:
+                sys.exit(f"{path}: Pod={podfile} not found in {qdir}")
+            for badk in ("Network", "PublishPort"):
+                if badk in cdict:
+                    sys.exit(f"{path}: {badk}= must be set on {podfile}, not on the member container")
+        for vol in cdict.get("Volume", []):
+            src = vol.split(":", 1)[0]
+            if not src.startswith("/"):
+                sys.exit(f"{path}: Volume source must be an absolute path: {vol}")
+        for sec_spec in cdict.get("Secret", []):
+            opts = sec_spec.split(",")[1:]
+            kv = dict(o.split("=", 1) for o in opts if "=" in o)
+            t = kv.get("type")
+            if t == "mount":
+                if not kv.get("target", "").startswith("/"):
+                    sys.exit(f"{path}: Secret mount target must be absolute: {sec_spec}")
+            elif t == "env":
+                if not kv.get("target"):
+                    sys.exit(f"{path}: Secret env target missing: {sec_spec}")
+            else:
+                sys.exit(f"{path}: Secret must specify type=mount or type=env: {sec_spec}")
+' "$qdir" || return 1
+
+	for g in /usr/lib/systemd/system-generators/podman-system-generator \
+		/usr/lib/systemd/user-generators/podman-system-generator \
+		/usr/libexec/podman/quadlet; do
+		[[ -x $g ]] && { gen=$g; break; }
+	done
+	if [[ -n $gen ]]; then
+		tmp=$(mktemp -d)
+		write_quadlet_networks "$tmp"
+		cp -a "$qdir/." "$tmp/"
+		chmod -R a+rX "$tmp"
+		local svc_name
+		svc_name=$(basename "$(dirname "$dir")")
+		if ! _podman_pretty "quadlet-generator ($svc_name)" env QUADLET_UNIT_DIRS="$tmp" "$gen" --user --dryrun; then
+			rm -rf "$tmp"
+			return 1
+		fi
+		rm -rf "$tmp"
+	fi
+	return 0
+}
+
+# render_service SVC DIR RELEASE: copy the service and render its templates.
+render_service() {
+	local svc=$1 dir=$2 release=$3 f missing runtime=podman
+	missing=$(missing_needs)
+	[[ -z $missing ]] || die "$svc needs $missing in the host file ($SRV_HOST_ENV), or remove $svc from services="
+	mkdir -p "$dir"
+	cp -a "$SRV_ROOT/services/$svc/." "$dir/"
+	if [[ -d $dir/config ]]; then
+		while IFS= read -r -d '' f; do
+			render_file "$f"
+		done < <(find "$dir/config" -type f -print0)
+	fi
+	if [[ -d $dir/quadlet ]]; then
+		_expand_agy_quadlets "$dir/quadlet"
+		if [[ $svc == mail ]]; then
+			HOST[opendkim_secrets]=$(_dkim_secret_lines opendkim "$dir/config/opendkim/KeyTable")
+			HOST[openarc_secrets]=$(_dkim_secret_lines openarc "$dir/config/openarc/openarc.conf")
+		fi
+		for f in "$dir/quadlet"/*.pod "$dir/quadlet"/*.container "$dir/quadlet"/*.network; do
+			[[ -f $f ]] || continue
+			render_file "$f"
+			_expand_quadlet_vars "$f" "$svc" "$release" "$dir"
+		done
+	fi
+	# Values recorded in .env for hooks and scripts.
+	{
+		echo "SRV_RUNTIME=$runtime"
+		echo "SRV_SERVICE=$svc"
+		echo "SRV_RELEASE=$release"
+		echo "SRV_RELEASE_DIR=$dir"
+		echo "SRV_DATA=${HOST[data_dir]}"
+		[[ -z $(service_volumes "$svc") ]] || echo "SRV_VOLUMES=${HOST[volumes_dir]}"
+		echo "SRV_TZ=${HOST[tz]}"
+	} >"$dir/.env"
+	{
+		echo "service=$svc"
+		echo "release=$release"
+		echo "runtime=$runtime"
+		echo "created=$(date -Is)"
+		echo "commit=$(git -C "$SRV_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+		# --no-optional-locks: git status otherwise refreshes .git/index, and srv
+		# runs as root, so the index of the checkout (in the data folder, owned
+		# by the data owner) became root's: box check flagged it after every deploy.
+		if [[ -n $(git -C "$SRV_ROOT" --no-optional-locks status --porcelain -- "services/$svc" 2>/dev/null) ]]; then
+			echo "dirty=yes   # services/$svc had uncommitted changes"
+		fi
+	} >"$dir/release.info"
+	# Rootless Podman reads release configs and Quadlet units as unix_role.
+	chmod 0755 "$dir"
+	chmod 0644 "$dir/.env" "$dir/release.info"
+	[[ -d $dir/quadlet ]] && chmod -R a+rX "$dir/quadlet"
+	[[ -d $dir/config ]] && chmod -R a+rX "$dir/config"
+	return 0
+}
+
+# ------------------------------------------------------------ release state
+
+svc_state() { echo "$SRV_STATE/$1"; }
+project_name() { echo "$1-$2"; }
+has_podman() { command -v podman >/dev/null 2>&1; }
+podman_user() { echo "${HOST[unix_role]:-${SRV_DEFAULT_UNIX_ROLE:-blunderer}}"; }
+podman_home() {
+	local h
+	h=$(getent passwd "$(podman_user)" 2>/dev/null | cut -d: -f6 || true)
+	echo "${h:-/home/$(podman_user)}"
+}
+podman_unit_dir() { echo "${SRV_PODMAN_UNIT_DIR:-$(podman_home)/.config/containers/systemd}"; }
+pctl() { SRV_PODMAN_USER=$(podman_user) rt_podman "$@"; }
+uctl() { SRV_PODMAN_USER=$(podman_user) rt_uctl "$@"; }
+
+# podman_units_of_dir DIR: systemd unit names generated by DIR/quadlet, pod first.
+podman_units_of_dir() {
+	local qdir="$1/quadlet" f base
+	[[ -d $qdir ]] || return 0
+	for f in "$qdir"/*.pod; do
+		[[ -f $f ]] || continue
+		base=$(basename "$f" .pod)
+		echo "$base-pod.service"
+	done
+	for f in "$qdir"/*.container; do
+		[[ -f $f ]] || continue
+		base=$(basename "$f" .container)
+		echo "$base.service"
+	done
+}
+
+# podman_containers_of_dir DIR: ContainerName= values from DIR/quadlet/*.container.
+podman_containers_of_dir() {
+	local qdir="$1/quadlet" f c
+	[[ -d $qdir ]] || return 0
+	for f in "$qdir"/*.container; do
+		[[ -f $f ]] || continue
+		c=$(sed -n 's/^[[:space:]]*ContainerName=//p' "$f" | head -n 1)
+		[[ -n $c ]] && echo "$c"
+	done
+}
+
+# resolve_podman_container SVC DIR [SHORT]: resolve short name or empty to ContainerName.
+resolve_podman_container() {
+	local svc=$1 dir=$2 short=${3:-} c
+	local -a ctrs=()
+	mapfile -t ctrs < <(podman_containers_of_dir "$dir")
+	((${#ctrs[@]} > 0)) || return 1
+	if [[ -z $short ]]; then
+		case $svc in
+			web) [[ " ${ctrs[*]} " == *" srv-web-nginx "* ]] && { echo srv-web-nginx; return 0; } ;;
+			mail) [[ " ${ctrs[*]} " == *" srv-mail-postfix "* ]] && { echo srv-mail-postfix; return 0; } ;;
+		esac
+		echo "${ctrs[0]}"
+		return 0
+	fi
+	for c in "${ctrs[@]}"; do
+		[[ $c == "$short" || $c == "srv-$svc-$short" || $c == "srv-$short" ]] && { echo "$c"; return 0; }
+	done
+	case "$svc:$short" in
+		dns:bind | db:mariadb | onion:tor | torrent:transmission | minecraft:bedrock | vpn:wireguard | jellyfin:jellyfin | agy:agy | agy:default)
+			[[ " ${ctrs[*]} " == *" srv-$svc "* ]] && { echo "srv-$svc"; return 0; } ;;
+	esac
+	return 1
+}
+
+# ensure_quadlet_networks: install srv-web.network & srv-db.network for the Podman user.
+ensure_quadlet_networks() {
+	local u grp home udir tmp
+	u=$(podman_user)
+	id "$u" >/dev/null 2>&1 || return 0
+	grp=$(id -gn "$u" 2>/dev/null || echo "$u")
+	home=$(podman_home)
+	udir=$(podman_unit_dir)
+	install -d -m 0755 -o "$u" -g "$grp" "$home/.config" "$home/.config/containers" "$udir"
+	tmp=$(mktemp -d)
+	write_quadlet_networks "$tmp"
+	install -m 0644 -o "$u" -g "$grp" "$tmp/srv-web.network" "$udir/srv-web.network"
+	install -m 0644 -o "$u" -g "$grp" "$tmp/srv-db.network" "$udir/srv-db.network"
+	rm -rf "$tmp"
+	if has_podman && [[ ${SRV_PODMAN_NO_SYSTEMD:-0} != 1 ]] && command -v systemctl >/dev/null 2>&1; then
+		uctl daemon-reload >/dev/null 2>&1 || true
+	fi
+}
+
+# install_quadlets SVC REL: install SVC/REL/quadlet units and reload user systemd.
+install_quadlets() {
+	local svc=$1 rel=$2 qdir u grp home udir f
+	qdir="$(svc_state "$svc")/$rel/quadlet"
+	u=$(podman_user)
+	grp=$(id -gn "$u" 2>/dev/null || echo "$u")
+	home=$(podman_home)
+	udir=$(podman_unit_dir)
+	install -d -m 0755 -o "$u" -g "$grp" "$home/.config" "$home/.config/containers" "$udir"
+	rm -f "$udir/srv-$svc.pod" "$udir/srv-$svc.container" "$udir/srv-$svc"-*.container
+	for f in "$qdir"/*.pod "$qdir"/*.container; do
+		[[ -f $f ]] || continue
+		install -m 0644 -o "$u" -g "$grp" "$f" "$udir/$(basename "$f")"
+	done
+	uctl daemon-reload
+}
+
+# remove_quadlets SVC [DIR]: remove SVC's Quadlet units from user systemd and reload.
+remove_quadlets() {
+	local svc=$1 dir=${2:-} udir f removed=0
+	udir=$(podman_unit_dir)
+	[[ -d $udir ]] || return 0
+	if [[ -n $dir && -d $dir/quadlet ]]; then
+		for f in "$dir/quadlet"/*.pod "$dir/quadlet"/*.container; do
+			[[ -f $f ]] || continue
+			rm -f "$udir/$(basename "$f")"
+			removed=1
+		done
+	fi
+	for f in "$udir/srv-$svc.pod" "$udir/srv-$svc.container" "$udir/srv-$svc"-*.container; do
+		[[ -f $f ]] || continue
+		rm -f "$f"
+		removed=1
+	done
+	if ((removed)) && has_podman && [[ ${SRV_PODMAN_NO_SYSTEMD:-0} != 1 ]] && command -v systemctl >/dev/null 2>&1; then
+		uctl daemon-reload >/dev/null 2>&1 || true
+	fi
+}
+
+podman_external_images() {
+	local qdir="$1/quadlet" f img
+	[[ -d $qdir ]] || return 0
+	for f in "$qdir"/*.container; do
+		[[ -f $f ]] || continue
+		img=$(sed -n 's/^[[:space:]]*Image=//p' "$f" | head -n 1)
+		[[ -n $img && $img != localhost/srv/* ]] && echo "$img"
+	done | sort -u
+}
+
+_podman_pretty() {
+	local label=$1 rc=0 log pid t0
+	shift
+	if [[ ${SRV_VERBOSE:-0} == 1 ]] || ! command -v python3 >/dev/null 2>&1; then
+		"$@"
+		return
+	fi
+	log=$(mktemp)
+	t0=${EPOCHREALTIME:-$(date +%s)}
+	"$@" >"$log" 2>&1 &
+	pid=$!
+	trap 'kill "$pid" 2>/dev/null || true; rm -f "$log"; exit 130' INT TERM
+	python3 "$SRV_ROOT/lib/podman_progress.py" --pid "$pid" --log "$log" --label "$label" --start "$t0" || true
+	wait "$pid" || rc=$?
+	trap - INT TERM
+	python3 "$SRV_ROOT/lib/podman_progress.py" --finish "$rc" --log "$log" --label "$label" --start "$t0" || true
+	rm -f "$log"
+	return "$rc"
+}
+
+# _podman_run_jobs MAX_JOBS SPEC...
+# Each SPEC is tab-separated:
+#   pull<TAB>LABEL<TAB>IMAGE
+#   build<TAB>LABEL<TAB>TAG<TAB>CTX
+_podman_run_jobs() {
+	local max_jobs=$1
+	shift
+	local -a specs=("$@")
+	local n=${#specs[@]} i=0 kind label arg1 arg2 rc=0
+	((n > 0)) || return 0
+
+	# Single job or serial mode (max_jobs <= 1): run sequentially with single-line progress.
+	if ((n == 1 || max_jobs <= 1)); then
+		for spec in "${specs[@]}"; do
+			IFS=$'\t' read -r kind label arg1 arg2 <<<"$spec"
+			if [[ $kind == pull ]]; then
+				_podman_pretty "$label" pctl pull "$arg1" || return 1
+			else
+				_podman_pretty "$label" pctl build --pull -t "$arg1" "$arg2" || return 1
+			fi
+		done
+		return 0
+	fi
+
+	local tmpdir
+	tmpdir=$(mktemp -d)
+	local -a labels=()
+	for spec in "${specs[@]}"; do
+		IFS=$'\t' read -r _ label _ _ <<<"$spec"
+		labels+=("$label")
+	done
+	python3 -c '
+import json, sys
+jobs = [{"id": idx, "label": lbl} for idx, lbl in enumerate(sys.argv[2:])]
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    json.dump(jobs, fh)
+' "$tmpdir/jobs.json" "${labels[@]}"
+
+	local -a pids=()
+	trap 'kill "${pids[@]}" 2>/dev/null || true; rm -rf "$tmpdir"; exit 130' INT TERM
+
+	# Launch workers with bounded concurrency in a background subshell so the
+	# multi-row renderer can run in the foreground immediately.
+	(
+		local idx=0 running=0
+		for spec in "${specs[@]}"; do
+			IFS=$'\t' read -r kind label arg1 arg2 <<<"$spec"
+			while ((running >= max_jobs)); do
+				wait -n 2>/dev/null || true
+				running=$((running - 1))
+			done
+			(
+				printf '%s\n' "${EPOCHREALTIME:-$(date +%s)}" >"$tmpdir/$idx.start"
+				jrc=0
+				if [[ $kind == pull ]]; then
+					pctl pull "$arg1" >"$tmpdir/$idx.log" 2>&1 || jrc=$?
+				else
+					pctl build --pull -t "$arg1" "$arg2" >"$tmpdir/$idx.log" 2>&1 || jrc=$?
+				fi
+				printf '%s\n' "$jrc" >"$tmpdir/$idx.rc.tmp"
+				mv -f "$tmpdir/$idx.rc.tmp" "$tmpdir/$idx.rc"
+			) &
+			running=$((running + 1))
+			idx=$((idx + 1))
+		done
+		wait
+	) &
+	local sched_pid=$!
+	pids=("$sched_pid")
+
+	if [[ ${SRV_VERBOSE:-0} == 1 ]] || ! command -v python3 >/dev/null 2>&1; then
+		wait "$sched_pid" || true
+		for ((i = 0; i < n; i++)); do
+			info "${labels[i]}"
+			cat "$tmpdir/$i.log" 2>/dev/null || true
+			local jrc
+			jrc=$(cat "$tmpdir/$i.rc" 2>/dev/null || echo 1)
+			((jrc == 0)) || rc=1
+		done
+	else
+		python3 "$SRV_ROOT/lib/podman_progress.py" --multi "$tmpdir" || rc=$?
+		wait "$sched_pid" || true
+	fi
+	trap - INT TERM
+	rm -rf "$tmpdir"
+	return "$rc"
+}
+
+podman_collect_service_jobs() {
+	local dir=$1 rel=$2 prefix=${3:-} img short entry repo ctx
+	while read -r img; do
+		[[ -n $img ]] || continue
+		short=${img%@sha256:*}
+		printf 'pull\t%spull %s\t%s\t\n' "$prefix" "$short" "$img"
+	done < <(podman_external_images "$dir")
+	for entry in ${META[IMAGES]:-}; do
+		repo=${entry%%=*}
+		ctx="$dir/${entry#*=}"
+		[[ -d $ctx ]] || { warn "missing build context $ctx"; return 1; }
+		printf 'build\t%sbuild %s:%s\t%s:%s\t%s\n' "$prefix" "$repo" "$rel" "$repo" "$rel" "$ctx"
+	done
+}
+
+# podman_sync_images DIR REL [QFLAG] [MAX_JOBS]: pull external images and build
+# local IMAGES= for a service, running in parallel with multi-row progress when
+# MAX_JOBS > 1 (defaults to SRV_BUILD_JOBS).
+podman_sync_images() {
+	local dir=$1 rel=$2 qflag=${3:-} max_j=${4:-${SRV_BUILD_JOBS:-4}}
+	if [[ -n $qflag ]]; then
+		podman_pull_images "$dir" "$qflag" || return 1
+		podman_build_images "$dir" "$rel" "$qflag" || return 1
+		return 0
+	fi
+	local -a jobs=()
+	mapfile -t jobs < <(podman_collect_service_jobs "$dir" "$rel") || return 1
+	((${#jobs[@]} > 0)) || return 0
+	[[ ${SRV_VERBOSE:-0} == 1 ]] && max_j=1
+	_podman_run_jobs "$max_j" "${jobs[@]}"
+}
+
+podman_pull_images() {
+	local dir=$1 qflag=${2:-} img short
+	while read -r img; do
+		[[ -n $img ]] || continue
+		if [[ -n $qflag ]]; then
+			pctl pull -q "$img" || return 1
+		else
+			short=${img%@sha256:*}
+			_podman_pretty "pull $short" pctl pull "$img" || return 1
+		fi
+	done < <(podman_external_images "$dir")
+}
+
+podman_build_images() {
+	local dir=$1 rel=$2 qflag=${3:-} entry repo ctx
+	for entry in ${META[IMAGES]:-}; do
+		repo=${entry%%=*}
+		ctx="$dir/${entry#*=}"
+		[[ -d $ctx ]] || { warn "missing build context $ctx"; return 1; }
+		if [[ -n $qflag ]]; then
+			pctl build --pull -q -t "${repo}:${rel}" "$ctx" || return 1
+		else
+			_podman_pretty "build ${repo}:${rel}" pctl build --pull -t "${repo}:${rel}" "$ctx" || return 1
+		fi
+	done
+}
+
+# read_link SVC current|previous -> release name or empty
+read_link() {
+	local l
+	l="$(svc_state "$1")/$2"
+	if [[ -L $l ]]; then basename "$(readlink "$l")"
+	elif [[ -f $l ]]; then cat "$l"
+	fi
+}
+
+set_link() {
+	local svc=$1 name=$2 target=$3 l
+	l="$(svc_state "$svc")/$name"
+	rm -f "$l"
+	[[ -z $target ]] || ln -s "$target" "$l"
+}
+
+# stop_release SVC REL ; start_release SVC REL
+stop_release() {
+	local svc=$1 rel=$2 dir pf pname
+	local -a units=()
+	dir="$(svc_state "$svc")/$rel"
+	mapfile -t units < <(podman_units_of_dir "$dir")
+	if ((${#units[@]} > 0)); then
+		# Stop containers first, then pod (if any).
+		local i
+		for ((i = ${#units[@]} - 1; i >= 0; i--)); do
+			uctl stop "${units[i]}" >/dev/null 2>&1 || true
+		done
+	fi
+	for pf in "$dir/quadlet"/*.pod; do
+		[[ -f $pf ]] || continue
+		pname=$(sed -n 's/^[[:space:]]*PodName=//p' "$pf" | head -n 1)
+		[[ -z $pname ]] || pctl pod rm -f -i "$pname" >/dev/null 2>&1 || true
+	done
+	remove_quadlets "$svc" "$dir"
+}
+
+start_release() {
+	local svc=$1 rel=$2 dir
+	local -a units=()
+	dir="$(svc_state "$svc")/$rel"
+	ensure_quadlet_networks
+	install_quadlets "$svc" "$rel"
+	mapfile -t units < <(podman_units_of_dir "$dir")
+	((${#units[@]} > 0)) || { warn "$svc/$rel: no quadlet units"; return 1; }
+	uctl start "${units[@]}" || return 1
+}
+
+# wait_healthy SVC REL TIMEOUT: every container running, and healthy if it
+# has a healthcheck. Renders one live line per container on a TTY.
+wait_healthy() {
+	local svc=$1 rel=$2 timeout=$3 start=$SECONDS c pending failed dir short st elapsed frame=0 tty=0 drawn=0 i
+	local -a ids=() names=() states=() kinds=() spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+	[[ -t 1 && ${SRV_VERBOSE:-0} != 1 ]] && tty=1
+	_wh_draw() {
+		((tty)) || return 0
+		local idx n=${#names[@]} s=${spin[frame % ${#spin[@]}]}
+		if ((drawn)); then
+			printf '\033[%dA' "$n"
+		fi
+		for ((idx = 0; idx < n; idx++)); do
+			case ${kinds[idx]} in
+				ok)   printf '\r\033[2K  %sok%s  %-16s %s\n' "$C_GRN" "$C_OFF" "${names[idx]}" "${states[idx]}" ;;
+				fail) printf '\r\033[2K %sFAIL%s %-16s %s\n' "$C_RED" "$C_OFF" "${names[idx]}" "${states[idx]}" ;;
+				*)    printf '\r\033[2K   %s  %-16s %s (%ds/%ds)\n' "$s" "${names[idx]}" "${states[idx]}" "$elapsed" "$timeout" ;;
+			esac
+		done
+		drawn=1
+		frame=$((frame + 1))
+	}
+	dir="$(svc_state "$svc")/$rel"
+	mapfile -t ids < <(podman_containers_of_dir "$dir")
+	[[ ${#ids[@]} -gt 0 ]] || { warn "no containers defined in $dir/quadlet"; return 1; }
+	local -A cur_st=() cur_hl=()
+	local cname cstatus chealth
+	while :; do
+		pending=0
+		failed=''
+		names=() states=() kinds=()
+		cur_st=() cur_hl=()
+		elapsed=$((SECONDS - start))
+		while read -r cname cstatus chealth; do
+			[[ -n $cname ]] || continue
+			cur_st[$cname]=$cstatus
+			cur_hl[$cname]=${chealth:-none}
+		done < <(pctl inspect --format '{{.Name}} {{.State.Status}} {{if and .State.Health .State.Health.Status}}{{.State.Health.Status}}{{else}}none{{end}}' "${ids[@]}" 2>/dev/null || true)
+		for c in "${ids[@]}"; do
+			cstatus=${cur_st[$c]:-missing}
+			chealth=${cur_hl[$c]:-none}
+			short=${c#"srv-${svc}-"}
+			st=$cstatus
+			[[ $chealth == none ]] || st="$cstatus/$chealth"
+			names+=("$short")
+			states+=("$st")
+			case "$cstatus/$chealth" in
+				running/healthy | running/none) kinds+=(ok) ;;
+				running/starting | missing/none | created/* | configured/* | initialized/*)
+					kinds+=(wait); pending=1 ;;
+				*/unhealthy | exited/* | dead/* | stopped/*)
+					kinds+=(fail); failed="$c is $cstatus ($chealth)" ;;
+				*) kinds+=(wait); pending=1 ;;
+			esac
+		done
+		_wh_draw
+		if [[ -n $failed ]]; then
+			warn "container $failed"
+			return 1
+		fi
+		if [[ $pending == 0 ]]; then
+			return 0
+		fi
+		if ((elapsed >= timeout)); then
+			local summary=''
+			for ((i = 0; i < ${#names[@]}; i++)); do summary+="${names[i]}(${states[i]}) "; done
+			warn "not healthy after ${timeout}s (${summary% })"
+			return 1
+		fi
+		sleep 2
+	done
+}
+
+_subid_start() { rt_subid_start "$@"; }
+
+run_hook() { # run_hook SVC HOOK [REL_DIR [ARG...]] -- extra env must be exported by caller
+	local svc=$1 hook=$2 dir=${3:-$SRV_ROOT/services/$1} k pu puid pgid su_start sg_start
+	shift 3 2>/dev/null || shift $#
+	local script="$dir/hooks/$hook"
+	[[ -x $script ]] || return 0
+	info "running hook $svc/$hook"
+	pu=$(podman_user)
+	puid=$(id -u "$pu" 2>/dev/null || echo 1000)
+	pgid=$(id -g "$pu" 2>/dev/null || echo 1000)
+	su_start=$(_subid_start /etc/subuid "$pu" "$puid")
+	sg_start=$(_subid_start /etc/subgid "$pu" "$puid")
+	local -a envs=(SRV_ROOT="$SRV_ROOT" SRV_SERVICE="$svc" SRV_DATA="${HOST[data_dir]}"
+		SRV_VOLUMES="${HOST[volumes_dir]}" SRV_STATE="$SRV_STATE" SRV_HOST_ENV="$SRV_HOST_ENV"
+		SRV_PODMAN_USER="$pu" SRV_UNIX_UID="$puid" SRV_UNIX_GID="$pgid"
+		SRV_SUBUID_START="$su_start" SRV_SUBGID_START="$sg_start")
+	for k in "${!HOST[@]}"; do envs+=("SRV_V_$k=${HOST[$k]}"); done
+	env "${envs[@]}" "$script" "$@"
+}
+
+# service_volumes SVC: volume directory names under HOST[volumes_dir] for SVC.
+service_volumes() {
+	if [[ ${1:-} == agy ]]; then
+		echo "${HOST[agy_volume_names]:-}"
+	else
+		echo "${META[VOLUMES]:-}"
+	fi
+}
+
+# is_runtime_volume NAME: shared Unix-socket directory, never copied on switch.
+is_runtime_volume() {
+	case $1 in
+		onion | mail-saslauthd | autoheal-proxy) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# is_overlay_volume NAME: volume folder holding an overlayfs mount + upperdir.
+is_overlay_volume() {
+	case $1 in
+		jellyfin-overlay | agy-shares | agy-*-shares) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# unmount_tree DIR: unmount every mountpoint at or inside DIR (deepest first).
+# Returns 1 if any stays mounted, so callers never rsync into or rm -rf a live mount.
+unmount_tree() {
+	local dir m
+	dir=$(realpath -m "$1")
+	command -v findmnt >/dev/null 2>&1 || return 0
+	while IFS= read -r m; do
+		[[ $m == "$dir" || $m == "$dir"/* ]] || continue
+		umount "$m" || { warn "cannot unmount $m (still busy)"; return 1; }
+	done < <(findmnt -rn -o TARGET | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-)
+	return 0
+}
+
+# is_keepid_native_volume NAME: volume whose on-disk files stay at host uid/gid
+# 1000 (identity-mapped under UserNS=keep-id) or host root overlayfs.
+is_keepid_native_volume() {
+	case $1 in
+		onion | onion-state | jellyfin-overlay | \
+		agy-home | agy-work | agy-shares | agy-*-home | agy-*-work | agy-*-shares)
+			return 0 ;;
+		*)
+			return 1 ;;
+	esac
+}
+
+# release_volumes_dir SVC REL: SRV_VOLUMES recorded in REL's .env (if any).
+release_volumes_dir() {
+	local svc=$1 rel=$2
+	[[ -n $rel ]] || return 0
+	sed -n 's/^SRV_VOLUMES=//p' "$(svc_state "$svc")/$rel/.env" 2>/dev/null | tail -n 1
+}
+
+# volumes_dir_changed OLD_BASE: 0 when OLD_BASE differs from HOST[volumes_dir]
+# (dying if one sits inside the other); 1 when empty or the same path.
+volumes_dir_changed() {
+	local old=${1:-} src dst
+	[[ -n $old ]] || return 1
+	src=$(realpath -m "$old")
+	dst=$(realpath -m "${HOST[volumes_dir]}")
+	[[ $src != "$dst" ]] || return 1
+	[[ $dst != "$src"/* && $src != "$dst"/* ]] ||
+		die "volumes_dir ${HOST[volumes_dir]} overlaps previous $old (choose a non-nested path)"
+	return 0
+}
+
+ensure_infra() { # ensure_infra [SVC]
+	local svc=${1:-} v dst src rc cur="" old_base=""
+	ensure_quadlet_networks
+	if [[ -n $svc ]]; then
+		cur=$(read_link "$svc" current)
+		old_base=$(release_volumes_dir "$svc" "$cur")
+		volumes_dir_changed "$old_base" || old_base=""
+	fi
+	mkdir -p "${HOST[volumes_dir]}"
+	for v in $(service_volumes "$svc"); do
+		dst="${HOST[volumes_dir]}/$v"
+		if [[ ! -d $dst ]]; then
+			src=""
+			if ! is_runtime_volume "$v" && [[ -n $old_base && -d "$old_base/$v" ]]; then
+				src="$old_base/$v"
+			fi
+			if [[ -n $src ]]; then
+				info "seeding $dst from $src"
+				mkdir -p "$dst"
+				local -a rargs=(-aHAX --numeric-ids)
+				is_overlay_volume "$v" && rargs+=(--exclude=/mnt --exclude=/shared --exclude='/overlay/*/work')
+				rc=0
+				rsync "${rargs[@]}" "$src/" "$dst/" || rc=$?
+				# Exit 24 = vanished source files in a live spool/cache; migrate_volumes
+				# syncs the final state once the old containers have stopped.
+				[[ $rc == 0 || $rc == 24 ]] || die "cannot seed $dst from $src (rsync exit $rc)"
+			elif [[ -z $svc || ! -x $SRV_ROOT/services/$svc/hooks/prepare ]]; then
+				# Leave empty volumes uncreated when hooks/prepare sets service-specific UIDs.
+				mkdir -p "$dst"
+			fi
+		fi
+	done
+	if [[ -n $svc ]]; then mkdir -p "$(svc_state "$svc")"; fi
+}
+
+# migrate_volumes SVC CUR: after CUR stops, final-sync any previous volumes_dir
+# of CUR into HOST[volumes_dir]/<v>.
+migrate_volumes() {
+	local svc=$1 cur=$2 old_base="" v src dst dmode downer remount_overlay=0
+	[[ -n $cur ]] || return 0
+	old_base=$(release_volumes_dir "$svc" "$cur")
+	volumes_dir_changed "$old_base" || return 0
+	for v in $(service_volumes "$svc"); do
+		is_runtime_volume "$v" && continue
+		src="$old_base/$v"
+		[[ -d $src ]] || continue
+		dst="${HOST[volumes_dir]}/$v"
+		dmode=$(stat -c %a "$dst")
+		downer=$(stat -c %u:%g "$dst")
+		info "migrating $src -> $dst"
+		local -a rargs=(-aHAX --numeric-ids --delete)
+		if is_overlay_volume "$v"; then
+			unmount_tree "$dst" || return 1
+			rm -rf "$dst"/overlay/*/work
+			rargs+=(--exclude=/mnt --exclude=/shared --exclude='/overlay/*/work')
+			remount_overlay=1
+		fi
+		rsync "${rargs[@]}" "$src/" "$dst/" || return 1
+		chmod "$dmode" "$dst"
+		chown "$downer" "$dst"
+		case $v in
+			dns-lib | dns-cache) chown -R "$downer" "$dst" ;;
+			onion-state) install -d -m 0700 -o 1000 -g 1000 "$dst/hs" ;;
+			jellyfin-overlay) install -d -m 0755 -o 0 -g 0 "$dst/mnt" ;;
+			agy-shares | agy-*-shares) install -d -m 0755 -o 0 -g 0 "$dst/shared" ;;
+		esac
+	done
+	if ((remount_overlay)); then
+		local rel_dir=${SRV_RELEASE_DIR:-$SRV_ROOT/services/$svc}
+		case $svc in
+			jellyfin) SRV_RELEASE_DIR=$rel_dir SRV_CURRENT_PROJECT='' run_hook jellyfin mount "$rel_dir" || return 1 ;;
+			agy)      SRV_RELEASE_DIR=$rel_dir run_hook agy share "$rel_dir" || return 1 ;;
+		esac
+	fi
+}
+
+# drop_release SVC REL: Quadlet units clean containers on stop; images are pruned via prune_podman.
+drop_release() {
+	return 0
+}
+
+# discard_release SVC REL: remove a release that was never switched to (or
+# no longer is): its locally built images and its folder.
+discard_release() {
+	local svc=$1 rel=$2 dir
+	dir="$(svc_state "$1")/$2"
+	if [[ -d $dir/quadlet ]] && has_podman; then
+		local -a pimgs=()
+		mapfile -t pimgs < <(pctl images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E "^localhost/srv/.*:$rel\$" || true)
+		((${#pimgs[@]} == 0)) || pctl rmi "${pimgs[@]}" >/dev/null 2>&1 || true
+	fi
+	rm -rf "$(svc_state "$svc")/${rel:?}"
+	ok "$svc: release $rel removed"
+}
+
+# orphan_releases SVC: releases that are neither current nor previous and
+# are newer than current (a deploy that was declined, or failed at build or a hook).
+orphan_releases() {
+	local svc=$1 cur prev rel
+	cur=$(read_link "$svc" current)
+	prev=$(read_link "$svc" previous)
+	[[ -d $(svc_state "$svc") ]] || return 0
+	while read -r rel; do
+		[[ -n $rel && $rel != "$cur" && $rel != "$prev" ]] || continue
+		if [[ -z $cur || $rel > "$cur" ]]; then
+			echo "$rel"
+		fi
+	done < <(find "$(svc_state "$svc")" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' | sort)
+	return 0
+}
+
+# --------------------------------------------------------------- commands
+
+
+# need_current SVC: load the service and set CUR to its current srv release.
+CUR=''
+need_current() {
+	local svc=$1
+	load_host
+	load_meta "$svc"
+	CUR=$(read_link "$svc" current)
+	[[ -n $CUR ]] || die "$svc has no srv release running (status: srv status $svc)"
+}
+
+
+# diff_release_trees DIR_A LABEL_A DIR_B LABEL_B [DIFF_ARGS...]:
+# compare two rendered release directories while normalizing release names and
+# release paths so only real config or image/unit changes are shown.
+diff_release_trees() {
+	local da=$1 la=$2 db=$3 lb=$4 tmp ra rb pa pb rc=0
+	shift 4
+	ra=${da##*/}
+	rb=${db##*/}
+	pa=$(realpath -m "$da")
+	pb=$(realpath -m "$db")
+	tmp=$(mktemp -d)
+	cp -a "$da" "$tmp/a"
+	cp -a "$db" "$tmp/b"
+	rm -f "$tmp/a/release.info" "$tmp/b/release.info"
+	find "$tmp/a" -type f -exec sed -i \
+		-e "s|$pa|<RELEASE_DIR>|g" \
+		-e "s|$da|<RELEASE_DIR>|g" \
+		-e "s|^SRV_RELEASE=.*|SRV_RELEASE=<REL>|" \
+		-e "s|:${ra}\([[:space:]]*\\)\$|:<REL>\\1|" {} +
+	find "$tmp/b" -type f -exec sed -i \
+		-e "s|$pb|<RELEASE_DIR>|g" \
+		-e "s|$db|<RELEASE_DIR>|g" \
+		-e "s|^SRV_RELEASE=.*|SRV_RELEASE=<REL>|" \
+		-e "s|:${rb}\([[:space:]]*\\)\$|:<REL>\\1|" {} +
+	(cd "$tmp" && diff -ru "$@" a b) | \
+		sed -e "s|^\\(--- \\|+++ \\)a/|\\1$la/|" -e "s|^\\(--- \\|+++ \\)b/|\\1$lb/|" || true
+	# Re-run exit status check cleanly because pipe masks diff return code.
+	(cd "$tmp" && diff -ru "$@" a b >/dev/null 2>&1) || rc=$?
+	rm -rf "$tmp"
+	return "$rc"
+}
+
+
+# ------------------------------------------------------------------- main
+
+# ------------------------------------------------------------------- main
+
+load_cmd() {
+	local f="$SRV_ROOT/cmd/srv/$1.sh"
+	[[ -f $f ]] || die "unknown command '$1' (srv help)"
+	# shellcheck source=/dev/null
+	. "$f"
+}
+
+main() {
+	SRV_ARGS="$*"
+	while [[ ${1:-} == -* ]]; do
+		case $1 in
+			-y | --yes) SRV_YES=1 ;;
+			-v | --verbose) SRV_VERBOSE=1 ;;
+			-h | --help) load_cmd help; cmd_help; return 0 ;;
+			*) die "unknown option $1" ;;
+		esac
+		shift
+	done
+	local cmd=${1:-help}
+	shift || true
+	[[ $cmd =~ ^[a-z0-9-]+$ ]] || die "unknown command '$cmd' (srv help)"
+	load_cmd "$cmd"
+	"cmd_${cmd//-/_}" "$@"
+}
+
+main "$@"
