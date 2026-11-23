@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Before the containers are created: download folders and initial settings.
+set -euo pipefail
+# Files created here belong to the data folder's owner, not root.
+# shellcheck source=lib/data-owner.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/data-owner.sh"
+data_owner_init "$SRV_DATA"
+
+# The download folders (torrent_dir, often outside the data folder), owned
+# like the data folder: Transmission runs as 1000.
+for d in downloads in_progress torrent; do
+	[[ -d ${SRV_V_torrent_dir:?}/$d ]] && continue
+	mkdir_own "$SRV_V_torrent_dir/$d"
+	echo "created $SRV_V_torrent_dir/$d"
+done
+
+# Transmission rewrites settings.json itself, so it is only seeded once; later
+# changes go through the web UI (or edit <data>/transmission/settings.json
+# while the container is stopped).
+state="$SRV_DATA/transmission"
+if [[ ! -f $state/settings.json ]]; then
+	mkdir -p "$state"
+	cp "$SRV_RELEASE_DIR/config/settings.json" "$state/settings.json"
+	chown -R 1000:1000 "$state"
+	echo "seeded $state/settings.json"
+fi
+
+# Per-domain Google SSO allowlist for https://torrent.<domain>.
+domain=${SRV_V_domain:-blunderer.org}
+users="$SRV_DATA/users/websso"
+allowed="$users/torrent.$domain"
+legacy_allowed="$users/transmission.$domain"
+mkdir_own "$users"
+chmod 750 "$users"
+if [[ ! -s $allowed && -s $legacy_allowed ]]; then
+	cp -p "$legacy_allowed" "$allowed"
+	own "$allowed"
+	echo "migrated $legacy_allowed -> $allowed"
+elif [[ ! -s $allowed ]]; then
+	emails=${SRV_V_sso_emails:-${SRV_V_alert_email:-}}
+	(
+		umask 027
+		{
+			echo "# Google accounts allowed on https://torrent.$domain (one email per line)."
+			if [[ -n $emails ]]; then
+				tr ', \t' '\n' <<<"$emails" | sed '/^$/d'
+			fi
+		} >"$allowed"
+	)
+	own "$allowed"
+	echo "seeded $allowed"
+	if [[ ${SRV_V_is_leader:-no} != yes ]]; then
+		echo "torrent: copy $allowed to the leader so nightly 'box data push' keeps it"
+	fi
+fi
+chmod 640 "$allowed"
+if ! grep -qE '^[[:space:]]*[^#[:space:]]' "$allowed"; then
+	echo "torrent: add at least one allowed Google account email to $allowed (or set sso_emails in host.env)" >&2
+	exit 1
+fi

@@ -1,0 +1,49 @@
+[Unit]
+Description=Transmission torrent client (linuxserver image)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=srv-torrent
+Image=lscr.io/linuxserver/transmission:4.1.4@sha256:aaf349cd859ca9d5f34f394c56b8097c267a513283698adc4d07ee61d7cb1a85
+Network=srv-web.network
+NetworkAlias=torrent
+UserNS=keep-id
+User=0:0
+DropCapability=ALL
+AddCapability=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+PidsLimit=256
+StopTimeout=60
+PublishPort=51413:51413
+PublishPort=51413:51413/udp
+Environment=TZ=${SRV_TZ}
+Environment=PUID=1000
+Environment=PGID=1000
+Environment=HOST_WHITELIST=torrent.@domain@,torrent.@host@.@domain@
+Environment=PEERPORT=51413
+# Transmission state; settings.json is seeded from config/ (hooks/prepare).
+Volume=${SRV_DATA}/transmission:/config
+# Same paths as the old container: /data/{downloads,in_progress,torrent}.
+Volume=@torrent_dir@:/data
+HealthCmd=curl -fsS -o /dev/null http://127.0.0.1:9091/transmission/web/
+HealthTimeout=10s
+HealthRetries=2
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=1g --log-opt=tag=torrent
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+TimeoutStopSec=75
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=default.target

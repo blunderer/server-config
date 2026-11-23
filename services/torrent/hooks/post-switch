@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# After the switch: reload web so nginx picks up <data>/users/websso/torrent.<domain>.
+set -euo pipefail
+state=${SRV_STATE:-/srv/releases}
+[[ -L $state/web/current || -f $state/web/current ]] || exit 0
+"${SRV_ROOT:-$(dirname "$0")/../../..}/srv" reload web
