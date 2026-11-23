@@ -1,0 +1,14 @@
+;
+; Initial content of the dynamic zone for Let's Encrypt DNS-01 challenges,
+; copied once into the dns-lib volume folder on the DNS master (hooks/prepare).
+; BIND maintains it from then on: ssl/renew.sh adds and removes TXT records.
+;
+$TTL	60
+@	IN	SOA	ns0.blunderer.org. admin.blunderer.org. (
+			1		; Serial (BIND increments it on each update)
+			600		; Refresh
+			600		; Retry
+			1209600		; Expire
+			60 )		; Negative Cache TTL
+
+@ns_records@

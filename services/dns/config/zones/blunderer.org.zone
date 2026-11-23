@@ -1,0 +1,75 @@
+;
+; Zone file rendered by srv: the at-sign placeholders come from the host env file.
+; Website records use web_ip (the host named by web= in hosts.env); machine
+; records come from the inventory.
+;
+$TTL	300
+@	IN	SOA	blunderer.org. admin.blunderer.org. (
+			@zone_serial@	; Serial
+			600		; Refresh
+			600		; Retry
+			1209600		; Expire
+			600 )		; Negative Cache TTL
+;
+
+@ns_records@
+; Certificates: only Let's Encrypt, and only through the DNS challenge
+; (ssl/renew.sh). A broken-into web site cannot get one over HTTP, and no
+; other authority issues for this domain.
+@				IN	CAA	0 issue "letsencrypt.org; validationmethods=dns-01"
+@				IN	CAA	0 issuewild "letsencrypt.org; validationmethods=dns-01"
+
+blunderer.org.		IN MX	@mx_first@
+@mx_rest@
+
+@				IN A		@web_ip@
+; Machine records, generated from the inventory (hosts.env): each host,
+; its *.<host> wildcard CNAME, and its names (ns0, mail0...).
+@machine_records@
+
+; Website records: the host named by web= (box migrate).
+
+auth				IN A		@web_ip@
+jellyfin			IN A		@web_ip@
+torrent				IN A		@web_ip@
+prihse-ppms			IN A		@web_ip@
+mariage				IN A		@web_ip@
+27aout2011			IN A		@web_ip@
+lacordeaucou			IN A		@web_ip@
+la-corde-au-cou			IN A		@web_ip@
+dl				IN A		@web_ip@
+downloads			IN A		@web_ip@
+download			IN A		@web_ip@
+share				IN A		@web_ip@
+www				IN A		@web_ip@
+home				IN A		@web_ip@
+1000at8				IN A		@web_ip@
+cortex				IN A		@web_ip@
+cloud				IN A		@web_ip@
+code				IN A		@web_ip@
+source				IN A		@web_ip@
+git				IN A		@web_ip@
+gogs				IN A		@web_ip@
+
+; Let's Encrypt DNS-01: challenges live in the dynamic acme.blunderer.org
+; zone (zones-master.conf), delegated to the same servers.
+@acme_ns_records@
+_acme-challenge			IN CNAME	blunderer.org.acme.blunderer.org.
+@host_acme_records@
+
+; The submission name for mail clients, when smtp= is set (inventory): every
+; working mail host, in the dynamic smtp.blunderer.org zone (box
+; smtp-health), delegated to the same servers.
+@smtp_delegation@
+
+blunderer.org.			IN	TXT     ( "v=spf1 include:_spf.google.com mx@spf_extra@ -all" )
+blunderer.org.                  IN      TXT     ( "google-site-verification=UFQNc77aavBcDYcLJ4SBtLfO03_ZP-guhhHVh0h64iw" )
+
+s202611._domainkey          	IN      TXT     ( "v=DKIM1; k=rsa; " "p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyJ0n/dbYgT0EMsbgRwgHQsezufVwkXHQe4he75GZfHlL/5sIQ5K9z/tDoz3sbgGwhnqyLGzmP9C+XWf2uL48gpxXTvWUk2sezYfDceLPP5wXp9j2S1qDxUrLHCvscK4O9rJOsCFbx85V9pSLcYnbAe7YXogN74MEbP4m0qNaiZabOY1wshY+Zfs1AhuNRxFJxx2tvRhgm013" "yEK+LA1ISuvJTKRj/fiuCAn9bRNrUMkyBm9AMYHzgRBe0uL2zu5uETIi5fwA8u839uO7eUUWcp/WGNzPuPwXsboWB6KhTjtKO8gCWSYch8E9sbpvrr8wR4ALmEHcYvJm+xSNXi7hRwIDAQAB" )
+_dmarc				IN	TXT	( "v=DMARC1; p=quarantine; sp=quarantine; rua=mailto:dmarc-reports@blunderer.org" )
+; The other domains send their reports to dmarc-reports@blunderer.org too:
+; a report address in another domain must be authorized here (RFC 7489 7.1),
+; or reporters skip it.
+lelong.xyz._report._dmarc		IN	TXT	"v=DMARC1"
+libroxml.net._report._dmarc		IN	TXT	"v=DMARC1"
+libroxml.com._report._dmarc		IN	TXT	"v=DMARC1"

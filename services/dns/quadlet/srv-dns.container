@@ -1,0 +1,46 @@
+[Unit]
+Description=Authoritative DNS (BIND 9, ISC image)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=srv-dns
+Image=docker.io/internetsystemsconsortium/bind9:9.20@sha256:66092edb53c081fa11b1fa8219e99065b0f497cb38f568ba789702a4c10e2590
+Network=pasta
+UserNS=keep-id
+User=0:0
+DropCapability=ALL
+AddCapability=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+PidsLimit=256
+PublishPort=53:53/udp
+PublishPort=53:53/tcp
+Environment=TZ=${SRV_TZ}
+Volume=${SRV_RELEASE_DIR}/config:/etc/bind:ro
+Volume=${SRV_VOLUMES}/dns-lib:/var/lib/bind
+Volume=${SRV_VOLUMES}/dns-cache:/var/cache/bind
+Tmpfs=/var/log:size=64m,noexec,nosuid,nodev
+Secret=srv-tsig-acme,type=mount,target=/etc/srv/acme-tsig.key,mode=0444
+Secret=srv-tsig-smtp,type=mount,target=/etc/srv/smtp-tsig.key,mode=0444
+Secret=srv-tsig-xfer,type=mount,target=/etc/srv/xfer-tsig.key,mode=0444
+# Any DNS answer (even REFUSED) means named is up. CI checks that dig is in the image.
+HealthCmd=dig @127.0.0.1 +time=2 +tries=1 +norecurse . SOA
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=90s
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=512m --log-opt=tag=dns
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=300
+OOMScoreAdjust=-300
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# After the switch: the NS records of the dynamic zones follow ns= in the
+# inventory (acme.blunderer.org on the DNS master, smtp.blunderer.org on every
+# host: each is its primary). Their files live in the dns-lib volume folder,
+# created once from config/ and kept by BIND, so a change of ns= reaches them
+# only through a signed update.
+set -euo pipefail
+[[ ${SRV_V_dns_role:-} == master || -n ${SRV_V_smtp:-} ]] || exit 0
+domain=${SRV_V_domain:-blunderer.org}
+if ! command -v nsupdate >/dev/null || ! command -v dig >/dev/null; then
+	echo "nsupdate/dig missing (box packages): NS of the dynamic zones not checked" >&2
+	exit 0
+fi
+want=$(for n in ${SRV_V_ns:-ns0 ns1}; do echo "$n.$domain."; done | sort)
+
+sync_ns() { # sync_ns ZONE KEYFILE
+	local zone=$1 key=$2 have n
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		have=$(dig +short +norecurse @127.0.0.1 NS "$zone" 2>/dev/null) && [[ -n $have ]] && break
+		sleep 2
+	done
+	[[ -n $have ]] || { echo "$zone: no answer from the local BIND, NS not checked" >&2; return 0; }
+	have=$(sort <<<"$have")
+	[[ $have == "$want" ]] && return 0
+	{
+		echo "server 127.0.0.1"
+		echo "zone $zone"
+		for n in $want; do echo "update add $zone. 3600 NS $n"; done
+		for n in $have; do
+			grep -qxF "$n" <<<"$want" || echo "update delete $zone. NS $n"
+		done
+		echo "send"
+	} | nsupdate -k "$key" && echo "$zone: NS now ${want//$'\n'/ }"
+}
+
+[[ ${SRV_V_dns_role:-} != master ]] || sync_ns "acme.$domain" "$SRV_DATA/keys/acme/tsig.key"
+[[ -z ${SRV_V_smtp:-} ]] || sync_ns "smtp.$domain" "$SRV_DATA/keys/dns/smtp-tsig.key"

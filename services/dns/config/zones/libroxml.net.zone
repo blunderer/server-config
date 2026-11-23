@@ -1,0 +1,36 @@
+;
+; Zone file rendered by srv: the at-sign placeholders come from the host env file.
+; Website records use web_ip (the host named by web= in hosts.env).
+;
+$TTL	300
+@	IN	SOA	libroxml.net. admin.blunderer.org. (
+			@zone_serial@	; Serial
+			600		; Refresh
+			600		; Retry
+			1209600		; Expire
+			600 )		; Negative Cache TTL
+;
+
+@ns_records@
+; Certificates: only Let's Encrypt, and only through the DNS challenge
+; (ssl/renew.sh). A broken-into web site cannot get one over HTTP, and no
+; other authority issues for this domain.
+@				IN	CAA	0 issue "letsencrypt.org; validationmethods=dns-01"
+@				IN	CAA	0 issuewild "letsencrypt.org; validationmethods=dns-01"
+libroxml.net.		IN MX	@mx_first@
+@mx_rest@
+
+@                       IN A		@web_ip@
+www                     IN A		@web_ip@
+debian                  IN A		@web_ip@
+dl                      IN A		@web_ip@
+downloads               IN A		@web_ip@
+download                IN A		@web_ip@
+
+libroxml.net.		IN	TXT	( "v=spf1 include:_spf.google.com mx@spf_extra@ -all" )
+s202611._domainkey      IN      TXT     ( "v=DKIM1; k=rsa; " "p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAneuwJRDibna6wO19+V/0WqdKzyfUL8N7qRaVkbAfck1qyk+87x8pYdZxb5BAKmmr5qLhhJFmiJNlh4pTu7L9t+VzfVeX1J63y7J8NRaypv5BHwoanCI2wDBVY/FVXDm9n2tC34gyIBhQhqIlNJGRDibJRDO1gi5DqeSAiLlQReyi48nvGCwswYex8xztxTidzm7d6W9tHnHw" "wrSd9lj85SFaOWAcoygYHwNmz9HJGrXZO+3ucjExm8HxEJdKtyP+TNOEZK7KsYI1kkHswltSh3QpYCj1dtaP0LeGvnyhXWgSD90nsupNBtJYvUk9QQhCGlO+ReSaVqHa5AfVm/XwQQIDAQAB" )
+
+_dmarc			IN TXT		( "v=DMARC1; p=quarantine; sp=quarantine; rua=mailto:dmarc-reports@blunderer.org" )
+
+; Let's Encrypt DNS-01: the challenge for libroxml.net and *.libroxml.net (ssl/renew.sh).
+_acme-challenge		IN CNAME	libroxml.net.acme.blunderer.org.

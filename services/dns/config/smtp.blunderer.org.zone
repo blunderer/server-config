@@ -1,0 +1,17 @@
+;
+; Initial content of the dynamic zone smtp.blunderer.org: the name mail
+; clients (Gmail's "Send mail as") send through. Copied once into the
+; dns-lib volume folder (hooks/prepare); from then on
+; `box smtp-health` (cron, on the leader) keeps only the mail hosts of
+; smtp= (inventory) that work: STARTTLS on 587, then a login.
+;
+$TTL	60
+@	IN	SOA	ns0.blunderer.org. admin.blunderer.org. (
+			1		; Serial (BIND increments it on each update)
+			600		; Refresh
+			600		; Retry
+			1209600		; Expire
+			60 )		; Negative Cache TTL
+
+@ns_records@
+@smtp_records@

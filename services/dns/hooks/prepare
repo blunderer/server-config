@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Before the containers are created: the TSIG key the Let's Encrypt renewal
+# signs its DNS updates with, and the initial files of the dynamic zones in
+# the dns-lib volume folder: acme.blunderer.org on the DNS master,
+# smtp.blunderer.org on every host (each keeps its own, with smtp= set).
+set -euo pipefail
+# Files created here belong to the data folder's owner, not root.
+# shellcheck source=lib/data-owner.sh
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/data-owner.sh"
+. "${SRV_ROOT:-$(dirname "$0")/../../..}/lib/runtime.sh"
+data_owner_init "$SRV_DATA"
+
+svc_root="${SRV_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+rel_dir=${SRV_RELEASE_DIR:-$svc_root/services/dns}
+
+image=''
+if [[ -f $rel_dir/quadlet/srv-dns.container ]]; then
+	image=$(sed -n 's/^ *Image=\(.*internetsystemsconsortium\/bind9:[^ ]*\).*/\1/p' "$rel_dir/quadlet/srv-dns.container" | head -n 1)
+fi
+[[ -n $image ]] || { echo "no BIND image in $rel_dir" >&2; exit 1; }
+
+key="$SRV_DATA/keys/acme/tsig.key"
+if [[ ! -s $key ]]; then
+	install -d -m 0700 -o 0 -g 0 "$(dirname "$key")"
+	secret=$(head -c 32 /dev/urandom | base64)
+	(umask 077 && printf 'key "acme-update" {\n\talgorithm hmac-sha256;\n\tsecret "%s";\n};\n' "$secret" >"$key")
+	echo "created $key (TSIG key for Let's Encrypt DNS challenges; the leader's copy is the one used)"
+fi
+# The key box smtp-health signs smtp.blunderer.org's updates with. Each host
+# has its own (backup/data-sync.sh does not copy it): it only updates its
+# own BIND.
+smtp_key="$SRV_DATA/keys/dns/smtp-tsig.key"
+if [[ ! -s $smtp_key ]]; then
+	install -d -m 0700 -o 0 -g 0 "$(dirname "$smtp_key")"
+	secret=$(head -c 32 /dev/urandom | base64)
+	(umask 077 && printf 'key "smtp-update" {\n\talgorithm hmac-sha256;\n\tsecret "%s";\n};\n' "$secret" >"$smtp_key")
+	echo "created $smtp_key (TSIG key for box smtp-health)"
+fi
+# Shared TSIG key authenticating master-to-slave zone transfers and NOTIFY
+# (created on the leader and replicated to the secondaries).
+xfer_key="$SRV_DATA/keys/dns/xfer-tsig.key"
+if [[ ! -s $xfer_key ]]; then
+	if [[ ${SRV_V_dns_role:-} == slave ]]; then
+		echo "dns: missing $xfer_key (deploy dns on the leader first, then run: sudo box data push)" >&2
+		exit 1
+	fi
+	install -d -m 0700 -o 0 -g 0 "$(dirname "$xfer_key")"
+	secret=$(head -c 32 /dev/urandom | base64)
+	(umask 077 && printf 'key "xfer-tsig" {\n\talgorithm hmac-sha256;\n\tsecret "%s";\n};\n' "$secret" >"$xfer_key")
+	echo "created $xfer_key (TSIG key for zone transfers; replicate from the leader)"
+fi
+# Keep canonical TSIG keys root-only (0700 dir, 0600 file); Podman reads them via secrets.
+for k in "$key" "$smtp_key" "$xfer_key"; do
+	chown 0:0 "$k"
+	chmod 600 "$k"
+done
+# shellcheck disable=SC2016 # expanded inside the container
+read -r uid gid < <(rt_podman run --rm --entrypoint sh "$image" -c 'printf "%s %s\n" "$(id -u bind)" "$(id -g bind)"')
+h_uid=$(rt_host_id uid "$uid")
+h_gid=$(rt_host_id gid "$gid")
+for d in "${SRV_VOLUMES:?}/dns-lib" "$SRV_VOLUMES/dns-cache"; do
+	[[ -d $d ]] || install -d -m 0775 -o "$h_uid" -g "$h_gid" "$d"
+done
+
+zones=()
+[[ ${SRV_V_dns_role:-} == master ]] && zones+=(acme.blunderer.org)
+[[ -n ${SRV_V_smtp:-} ]] && zones+=(smtp.blunderer.org)
+for z in "${zones[@]}"; do
+	f="$SRV_VOLUMES/dns-lib/$z.zone"
+	if [[ ! -s $f ]]; then
+		install -m 0644 "$SRV_RELEASE_DIR/config/$z.zone" "$f"
+		chown --reference="$SRV_VOLUMES/dns-lib" "$f"
+		echo "created the $z zone in $SRV_VOLUMES/dns-lib"
+	fi
+done
