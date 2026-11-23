@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Refresh a standby host's running MariaDB from the newest replicated dump in
+# <data>/backups/mariadb/ (e.g. before `box migrate <src> <dest>`):
+#   srv hook db import-newest [--force]
+# Refuses to run on the active web= host unless --force is passed.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+if [[ ${1:-} != --force && -n ${SRV_V_web:-} && ${SRV_V_host:-} == "${SRV_V_web}" ]]; then
+	echo "refusing to overwrite the active web/db host (${SRV_V_web}); pass --force to override" >&2
+	exit 1
+fi
+
+[[ -n ${SRV_CURRENT_PROJECT:-} ]] || { echo "db is not deployed here" >&2; exit 1; }
+cid=$(find_container "$SRV_CURRENT_PROJECT") || { echo "no running database container" >&2; exit 1; }
+
+[[ -d $BACKUP_DIR ]] || { echo "no $BACKUP_DIR" >&2; exit 1; }
+newest=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '*.tmp.*' | sort | tail -n 1)
+[[ -n $newest ]] || { echo "no dump in $BACKUP_DIR" >&2; exit 1; }
+[[ -s $newest/10-users.sql || -s $newest/20-data.sql.gz ]] || { echo "dump $newest is empty or incomplete" >&2; exit 1; }
+[[ ! -f $newest/20-data.sql.gz ]] || gzip -t "$newest/20-data.sql.gz"
+
+# Drop existing non-system databases so tables/databases removed on the active
+# host do not linger on the standby.
+sql "$cid" -N -B -e "SHOW DATABASES" |
+	{ grep -vxE 'information_schema|performance_schema|mysql|sys' || true; } |
+	while read -r db; do
+		sql "$cid" -e "DROP DATABASE \`${db//\`/\`\`}\`" </dev/null
+	done
+
+if [[ -s $newest/10-users.sql ]]; then
+	sed 's/^CREATE USER IF NOT EXISTS /CREATE OR REPLACE USER /; s/^CREATE USER /CREATE OR REPLACE USER /' \
+		"$newest/10-users.sql" | sql "$cid"
+	sql "$cid" -e "FLUSH PRIVILEGES"
+fi
+if [[ -s $newest/20-data.sql.gz ]]; then
+	gzip -dc "$newest/20-data.sql.gz" | sql "$cid"
+fi
+echo "imported $newest into $cid"

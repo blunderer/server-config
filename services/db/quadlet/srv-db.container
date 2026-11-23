@@ -1,0 +1,48 @@
+[Unit]
+Description=MariaDB (official image, LTS series)
+
+[Container]
+ContainerName=srv-db
+Image=docker.io/library/mariadb:11.4@sha256:5e73baf8179b29f115101bb102763a47a017361f3e9792daccba6646c3ab1532
+Network=srv-db.network
+IP=@podman_db_ip@
+NetworkAlias=mymysql
+NetworkAlias=mysql
+UserNS=keep-id
+# As the data folder's owner, like the other services: the data directory
+# belongs to 1000, not to the image's mysql user (999).
+User=1000:1000
+DropCapability=ALL
+NoNewPrivileges=true
+PidsLimit=256
+StopTimeout=60
+Environment=TZ=${SRV_TZ}
+Environment=MARIADB_ROOT_PASSWORD_FILE=/run/secrets/root_password
+# Runs mariadb-upgrade when a newer image starts on existing data.
+Environment=MARIADB_AUTO_UPGRADE=1
+Secret=srv-db-root-password,type=mount,target=/run/secrets/root_password,mode=0400,uid=1000,gid=1000
+Volume=${SRV_DATA}/mariadb-v2:/var/lib/mysql
+# Imported only when mariadb-v2 is empty (filled by hooks/pre-switch).
+Volume=${SRV_DATA}/mariadb-v2-init:/docker-entrypoint-initdb.d:ro
+Volume=${SRV_RELEASE_DIR}/config/srv.cnf:/etc/mysql/conf.d/zz-srv.cnf:ro
+HealthCmd=healthcheck.sh --connect --innodb_initialized
+HealthTimeout=5s
+HealthRetries=3
+HealthInterval=15s
+HealthStartPeriod=5m
+HealthStartupInterval=5s
+HealthOnFailure=restart
+LogDriver=journald
+PodmanArgs=--memory=1g --log-opt=tag=db
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+TimeoutStartSec=600
+TimeoutStopSec=75
+OOMScoreAdjust=-200
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Before the containers are created: the root password file must exist
+# (docker would otherwise mount an empty directory in its place), and a host
+# without data yet gets the newest dump imported.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+ensure_password
+
+datadir="$SRV_DATA/mariadb-v2"
+initdir="$SRV_DATA/mariadb-v2-init"
+
+# datadir belongs to the data folder's owner: MariaDB runs as 1000.
+mkdir_own "$datadir"
+owner=$(stat -c %u "$datadir")
+if [[ $owner != 1000 ]]; then
+	echo "$datadir belongs to uid $owner, but MariaDB runs as 1000: stop db, then" >&2
+	echo "  chown -R 1000:1000 $datadir   and deploy again (docs/runbooks.md)" >&2
+	exit 1
+fi
+mkdir_own "$initdir"
+[[ -z $(ls -A "$datadir") ]] || exit 0
+
+# New host (e.g. vega): import the newest dump that arrived with the data
+# folder (backups/mariadb/<date>-*/, made by `srv hook db dump`).
+if [[ ! -d $BACKUP_DIR ]]; then
+	echo "no $BACKUP_DIR: the database starts empty (is data_dir=$SRV_DATA right?)"
+	exit 0
+fi
+newest=$(find "$BACKUP_DIR" -mindepth 2 -maxdepth 2 ! -path '*.tmp.*/*' -name 20-data.sql.gz -printf '%h\n' | sort | tail -n 1)
+if [[ -z $newest ]]; then
+	echo "no dump in $BACKUP_DIR: the database starts empty"
+	exit 0
+fi
+rm -rf "${initdir:?}"/*
+cp "$newest"/* "$initdir/"
+own "$initdir"/*
+echo "empty database: $newest will be imported on first start"

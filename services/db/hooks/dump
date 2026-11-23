@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Nightly consistent dump (cron: srv hook db dump). Copying the live data
+# directory with rsync is not a usable backup; these dumps are.
+#
+# Runs only on the active web/db host (web= in the inventory), unless --force
+# is passed, so warm standbys do not fill backups/mariadb with stale dumps.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+if [[ ${1:-} != --force && -n ${SRV_V_web:-} && ${SRV_V_host:-} != "${SRV_V_web}" ]]; then
+	echo "skipping dump on ${SRV_V_host:-this host}: active web/db host is ${SRV_V_web} (pass --force to dump anyway)"
+	exit 0
+fi
+
+cid=$(find_container) || true
+[[ -n ${cid:-} ]] || { echo "no running database" >&2; exit 1; }
+
+dump "$cid" "$BACKUP_DIR/$(date +%Y%m%d-%H%M%S)-nightly"
+prune "$BACKUP_DIR" 20
