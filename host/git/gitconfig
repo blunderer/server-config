@@ -1,0 +1,7 @@
+# Installed as /etc/gitconfig by box packages (host/git/gitconfig): edit it
+# there. A personal ~/.gitconfig still overrides it.
+[core]
+	editor = vim
+[user]
+	name = Tristan Lelong
+	email = tristan@lelong.xyz

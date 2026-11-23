@@ -1,0 +1,13 @@
+" Installed as /etc/vim/vimrc.local by box packages (host/vim/vimrc.local):
+" edit it there. A personal ~/.vimrc still overrides it.
+"
+" Vim's defaults.vim (loaded when there is no ~/.vimrc, after this file)
+" turns the mouse on. Load it here first, so the settings below win.
+if filereadable(expand('$VIMRUNTIME/defaults.vim'))
+  unlet! g:skip_defaults_vim
+  source $VIMRUNTIME/defaults.vim
+endif
+let g:skip_defaults_vim = 1
+
+" No mouse (as in tmux): the terminal keeps selecting and copying text.
+set mouse=
