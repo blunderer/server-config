@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# remote: run a box or srv command on another host of the inventory.
+#
+#   remote [-p|--parallel] <host|all> [sudo] box|srv <arguments...>
+#
+#   remote orion srv status
+#   remote orion sudo srv deploy dns        # prompts and colours as if there
+#   remote all sudo box -q check            # every other host, one after the other
+#   remote -p all sudo box -q check         # every other host in parallel (non-interactive)
+#   remote lyra sudo box mail spam --since -2d | less
+#
+# It connects with ssh as set up by box ssh-keys (this host's key, the admin
+# account, the peer's port), so it works for root and for the admin account.
+# The command's input, output and exit status are the remote one's: with a
+# terminal, the remote side gets one too (questions, sudo's password,
+# colours; output and errors then arrive together); in a pipe or a script,
+# input, output and errors stay three separate streams, and sudo must not
+# need a password (sudo -n).
+#
+# Only box and srv: for anything else, ssh <host>.
+set -euo pipefail
+
+usage() {
+	sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2
+	exit 2
+}
+
+parallel=0
+while [[ ${1:-} == -* ]]; do
+	case $1 in
+		-p | --parallel) parallel=1 ;;
+		-h | --help) usage ;;
+		*) echo "remote: unknown option '$1'" >&2; usage ;;
+	esac
+	shift
+done
+[[ $# -ge 2 ]] || usage
+target=$1
+shift
+if [[ ${1:-} == -p || ${1:-} == --parallel ]]; then
+	parallel=1
+	shift
+fi
+sudo=()
+if [[ $1 == sudo ]]; then
+	sudo=(sudo)
+	shift
+fi
+[[ $# -ge 1 ]] || usage
+case $1 in
+	box | srv) ;;
+	*)
+		echo "remote: only box and srv commands (got '$1'); for the rest: ssh $target" >&2
+		exit 2
+		;;
+esac
+
+srv=${SRV:-srv}
+self=$("$srv" get host 2>/dev/null) || self=$(hostname -s)
+hosts=$("$srv" get hosts 2>/dev/null) || hosts=''
+
+if [[ $target == all ]]; then
+	[[ -n $hosts ]] || { echo "remote: no inventory (srv get hosts): name a host" >&2; exit 2; }
+	targets=()
+	for h in $hosts; do [[ $h == "$self" ]] || targets+=("$h"); done
+else
+	[[ $target != "$self" ]] || { echo "remote: $target is this host: run the command directly" >&2; exit 2; }
+	[[ -z $hosts || " $hosts " == *" $target "* ]] ||
+		{ echo "remote: $target is not in the inventory ($hosts)" >&2; exit 2; }
+	targets=("$target")
+fi
+
+# A terminal on both ends when there is one here; else plain streams, and
+# neither ssh nor sudo waits for a password nobody can type.
+# When run as root (e.g. `sudo remote ...`), connect as admin_role so we do not
+# hit root's forced-command sync endpoint on the peer.
+ssh_opts=(-q)
+if ((EUID == 0)); then
+	adm=$("$srv" get admin_role 2>/dev/null || true)
+	[[ -n $adm && $adm != root ]] && ssh_opts+=(-l "$adm")
+fi
+# Propagate SSH agent forwarding when an agent is active so remote `sudo`
+# can authenticate via pam_ssh_agent_auth (including in non-interactive/parallel runs).
+[[ -n ${SSH_AUTH_SOCK:-} ]] && ssh_opts+=(-A)
+if ((parallel && ${#targets[@]} > 1)); then
+	ssh_opts+=(-T -o BatchMode=yes)
+	((${#sudo[@]} == 0)) || sudo=(env SUDO_ASKPASS=/bin/false sudo -A)
+elif [[ -t 0 && -t 1 ]]; then
+	ssh_opts+=(-t)
+else
+	ssh_opts+=(-T -o BatchMode=yes)
+	((${#sudo[@]} == 0)) || sudo=(env SUDO_ASKPASS=/bin/false sudo -A)
+fi
+
+# One shell-quoted string: ssh joins its arguments with spaces, which would
+# split "an argument with spaces" on the other side.
+cmd=$(printf '%q ' "${sudo[@]}" "$@")
+
+rc=0
+if ((parallel && ${#targets[@]} > 1)); then
+	tmpdir=$(mktemp -d)
+	trap 'rm -rf "$tmpdir"' EXIT
+	declare -A pids=()
+	for h in "${targets[@]}"; do
+		# shellcheck disable=SC2029 # quoted above, for the remote shell
+		ssh "${ssh_opts[@]}" "$h" "$cmd" </dev/null >"$tmpdir/$h.out" 2>&1 &
+		pids[$h]=$!
+	done
+	for h in "${targets[@]}"; do
+		hrc=0
+		wait "${pids[$h]}" || hrc=$?
+		echo "==> $h" >&2
+		cat "$tmpdir/$h.out"
+		((hrc == 0)) || rc=$hrc
+	done
+	exit "$rc"
+fi
+for h in "${targets[@]}"; do
+	# shellcheck disable=SC2029 # quoted above, for the remote shell
+	if ((${#targets[@]} > 1)); then
+		echo "==> $h" >&2
+		# Several hosts cannot share one piped input: the first would eat it.
+		if [[ -t 0 ]]; then
+			ssh "${ssh_opts[@]}" "$h" "$cmd" || rc=$?
+		else
+			ssh "${ssh_opts[@]}" "$h" "$cmd" </dev/null || rc=$?
+		fi
+	else
+		ssh "${ssh_opts[@]}" "$h" "$cmd" || rc=$?
+	fi
+done
+exit "$rc"
